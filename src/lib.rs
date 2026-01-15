@@ -22,8 +22,8 @@ where
     V: Serialize + DeserializeOwned + Send + Sync,
 {
     async fn get(&self, key: K) -> Option<V>;
-    async fn set(&self, key: K, value: V) -> Option<V>;
-    async fn delete(&self, key: K);
+    async fn set(&self, key: K, value: V) -> Result<Option<V>, anyhow::Error>;
+    async fn delete(&self, key: K) -> Result<V, anyhow::Error>;
 }
 
 // implement a version of struct KVLog that implements KVStore with the properties:
@@ -185,7 +185,7 @@ where
         read_guard.get(&key).cloned()
     }
 
-    async fn set(&self, key: K, value: V) -> Option<V> {
+    async fn set(&self, key: K, value: V) -> Result<Option<V>, anyhow::Error> {
         // create a log entry
         let entry = WALEntry::Set {
             key: key.clone(),
@@ -194,12 +194,11 @@ where
 
         // encode the log entry into raw bytes
         let encoded =
-            bincode::encode_to_vec(entry, bincode::config::standard()).expect("encoding failed");
+            bincode::encode_to_vec(entry, bincode::config::standard())?;
         // make sure the encoded entry len is u32 so that load() can use 4 bytes as the framing
         let prefix_len: u32 = encoded
             .len()
-            .try_into()
-            .expect("encoding failed: too large");
+            .try_into()?;
         // generate CRC32 checksum
         let checksum = crc32(&*encoded);
         let checksum_bytes = checksum.to_le_bytes();
@@ -220,33 +219,32 @@ where
         //  3. A then updates mem, then B updates mem — order depends on who gets mem lock first, not WAL order.
         {
             let mut f = self.log.write().await;
-            f.write_all(&to_write).await.expect("write failed");
+            f.write_all(&to_write).await?;
             // A crash or power loss during write_all or before sync_all can leave a partial entry
             // e.g., length prefix is written but not the full payload
             // write_all writes to the OS buffer; it guarantees the bytes are handed to the kernel, not that they’re on disk.
             // sync_all (fsync) asks the OS to flush those buffers to stable storage.
-            f.sync_all().await.expect("sync failed");
+            f.sync_all().await?;
 
             // acquire write lock of mem
             // as soon as the writer acquires mem.write() to update the HashMap,
             // any readers trying to acquire mem.read() will block until the writer releases that lock.
             let mut mem = self.mem.write().await;
             // HashMap insert API: if key not exist, return None, otherwise return old value
-            mem.insert(key, value)
+            anyhow::Ok(mem.insert(key, value))
         }
     }
 
-    async fn delete(&self, key: K) {
+    async fn delete(&self, key: K) -> Result<V, anyhow::Error>{
         let entry: WALEntry<K, V> = WALEntry::Delete { key: key.clone() };
 
         // encode the log entry into raw bytes
         let encoded =
-            bincode::encode_to_vec(entry, bincode::config::standard()).expect("encoding failed");
+            bincode::encode_to_vec(entry, bincode::config::standard())?;
         // make sure the encoded entry len is u32 so that load() can use 4 bytes as the framing
         let len_prefix: u32 = encoded
             .len()
-            .try_into()
-            .expect("encoding failed: too large");
+            .try_into()?;
         // generate CRC32 checksum
         let checksum = crc32(&*encoded);
         let checksum_bytes = checksum.to_le_bytes();
@@ -257,11 +255,11 @@ where
 
         {
             let mut f = self.log.write().await;
-            f.write_all(&to_write).await.expect("write failed");
-            f.sync_all().await.expect("sync failed");
+            f.write_all(&to_write).await?;
+            f.sync_all().await?;
 
             let mut mem = self.mem.write().await;
-            mem.remove(&key);
+            mem.remove(&key).ok_or(anyhow!("delete failed: key not found"))
         }
     }
 }
@@ -407,13 +405,13 @@ mod tests {
 
         // new key set will return None which is the old value
         let mut set_result = log.set(key.clone(), v1.clone()).await;
-        assert!(set_result.is_none(), "set should return old value aka None");
+        assert!(set_result.unwrap().is_none(), "set should return old value aka None");
 
         get_result = log.get(key.clone()).await;
         assert_eq!(get_result, Some(v1.clone()), "get should return value bar");
 
         set_result = log.set(key.clone(), v2.clone()).await;
-        assert_eq!(set_result, Some(v1), "set should return old value aka bar");
+        assert_eq!(set_result.unwrap(), Some(v1), "set should return old value aka bar");
 
         get_result = log.get(key.clone()).await;
         assert_eq!(get_result, Some(v2), "get should return new value aha");
@@ -623,6 +621,9 @@ mod tests {
     //       - Handle partial/torn WAL entries without panic - return error and let the caller decide what to do.
     //       - Checksums or CRC per entry to detect corruption. [prefix-length][checksum][payload]
     //       - Recovery tests for mid‑write crashes.
+    //   - Error handling
+    //       - No expect in core paths; return typed errors. Done
+    //       - Propagate fsync / IO errors to callers. Done
     //   - Durability semantics
     //       - Clear guarantees (fsync policy, when writes are visible).
     //       - Optional batched/async flush mode with explicit flush().
@@ -637,9 +638,6 @@ mod tests {
     //       - File locking to prevent multi‑process writers.
     //       - Safe open modes and permissions.
     //       - Metrics/logging for errors and latency.
-    //   - Error handling
-    //       - No expect in core paths; return typed errors.
-    //       - Propagate fsync / IO errors to callers.
     //   - Performance
     //       - Reduce fsync frequency (group commit).
     //       - Avoid holding WAL lock during long operations if possible.
