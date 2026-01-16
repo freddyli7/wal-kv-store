@@ -1,10 +1,12 @@
-use anyhow::{anyhow, Error};
 use bincode::{Decode, Encode};
 use crc32fast::Hasher;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use fs2::FileExt;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs::OpenOptions as std_OpenOptions;
 use std::hash::Hash;
 use std::sync::Arc;
+use thiserror::Error;
 use tokio::fs::File;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
@@ -22,10 +24,10 @@ where
     V: Serialize + DeserializeOwned + Send + Sync,
 {
     async fn get(&self, key: K) -> Option<V>;
-    async fn set_with_flush(&self, key: K, value: V) -> Result<Option<V>, anyhow::Error>;
-    async fn set_without_flush(&self, key: K, value: V) -> Result<Option<V>, anyhow::Error>;
-    async fn manual_flush(&self) -> Result<(), anyhow::Error>;
-    async fn delete(&self, key: K) -> Result<V, anyhow::Error>;
+    async fn set_with_flush(&self, key: K, value: V) -> Result<Option<V>, KVLogError>;
+    async fn set_without_flush(&self, key: K, value: V) -> Result<Option<V>, KVLogError>;
+    async fn manual_flush(&self) -> Result<(), KVLogError>;
+    async fn delete(&self, key: K) -> Result<V, KVLogError>;
 }
 
 // implement a version of struct KVLog that implements KVStore with the properties:
@@ -40,6 +42,8 @@ pub struct KVLog<K, V> {
     // No lock → any number of reads or a single writer
     mem: Arc<RwLock<HashMap<K, V>>>,
     log: Arc<RwLock<File>>, // Arc makes it shareable across threads / async tasks.
+    // _file_lock will keep the file lock held until KVLog is dropped.
+    _file_lock: std::fs::File,
 }
 
 #[derive(Serialize, Deserialize, Decode, Encode)]
@@ -48,7 +52,39 @@ enum WALEntry<K, V> {
     Delete { key: K },
 }
 
+#[derive(Debug, Error)]
+pub enum KVLogError {
+    #[error("io error: {0}")] // Display format
+    Io(#[from] std::io::Error), // any I/O error becomes KvError::Io.
+    #[error("decode error: {0}")]
+    Decode(#[from] bincode::error::DecodeError), // decode failures become KvError::Decode.
+    #[error("encode error: {0}")]
+    Encode(#[from] bincode::error::EncodeError),
+    #[error("int conversion error: {0}")]
+    Int(#[from] std::num::TryFromIntError),
+    #[error("corrupt wal: {0}")]
+    CorruptWal(String), // a custom error with your own message.
+    #[error("invalid prefix: {msg}")]
+    InvalidPrefix { msg: String },
+    #[error("key not found: {msg}")]
+    KeyNotFound { msg: String },
+}
+
 const MAX_ENTRY_SIZE: usize = 1024 * 1024; // 1 MiB, adjust as needed
+
+fn acquire_file_lock(p: &str) -> Result<std::fs::File, KVLogError> {
+    let path = std::path::Path::new(p);
+
+    let lock_path = path.with_extension("lock");
+    let file = std_OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(lock_path)?;
+    file.try_lock_exclusive()?;
+
+    Ok(file)
+}
 
 fn crc32(data: &[u8]) -> u32 {
     let mut hasher = Hasher::new();
@@ -56,9 +92,11 @@ fn crc32(data: &[u8]) -> u32 {
     hasher.finalize()
 }
 
-fn parse_prefix_bytes(d: &[u8]) -> anyhow::Result<u32> {
+fn parse_prefix_bytes(d: &[u8]) -> Result<u32, KVLogError> {
     if d.len() != 4 {
-        return Err(anyhow!("invalid prefix length: {}", d.len()));
+        return Err(KVLogError::InvalidPrefix {
+            msg: format!("invalid prefix length: {}", d.len()),
+        });
     }
     Ok(u32::from_le_bytes([d[0], d[1], d[2], d[3]]))
 }
@@ -86,7 +124,11 @@ where
     /// so WAL will be stored like: [01,02,03,04,aa,bb,cc,dd,5f,12,42,43,56,22,44,00,00,00,1a,ff,aa,33,aa,1c,3a,4b,11,25,54,65] which represent two entries:
     /// SET(1,2)
     /// DELETE(1)
-    pub async fn load(path: &str) -> anyhow::Result<Self> {
+    pub async fn load(path: &str) -> Result<Self, KVLogError> {
+        // acquires the file lock, so no other task(process) can access the file until this lock is released.
+        // store the lock handle inside KVLog so that lock stays held for the lifetime of the struct.
+        let _file_lock = acquire_file_lock(path)?;
+
         // open WAL or create one if missing
         let file = OpenOptions::new()
             .read(true)
@@ -117,16 +159,19 @@ where
                 // original: let len_prefix = u32::from_le_bytes(len_prefix_bytes.try_into().unwrap()) as usize;
                 let len_prefix = parse_prefix_bytes(len_prefix_bytes)? as usize;
                 if len_prefix > MAX_ENTRY_SIZE {
-                    return Err(anyhow!(
-                        "load entry failed: entry prefix too large: {} > {}",
-                        len_prefix,
-                        MAX_ENTRY_SIZE
-                    ));
+                    return Err(KVLogError::InvalidPrefix {
+                        msg: format!(
+                            "load entry failed: entry prefix too large: {} > {}",
+                            len_prefix, MAX_ENTRY_SIZE
+                        ),
+                    });
                 }
 
                 // check of partial entry (crash safe)
                 if rest.len() < 4 + len_prefix {
-                    return Err(anyhow!("load entry failed: truncated entry detected"));
+                    return Err(KVLogError::CorruptWal(
+                        "load entry failed: truncated entry detected".to_string(),
+                    ));
                 }
 
                 let (checksum_bytes, rest) = rest.split_at(4);
@@ -138,15 +183,14 @@ where
 
                 // CRC32 checksum verification for each entry loaded
                 if loaded_checksum != recomputed_checksum {
-                    return Err(anyhow!("load entry failed: entry checksum mismatch"));
+                    return Err(KVLogError::CorruptWal(
+                        "load entry failed: entry checksum mismatch".to_string(),
+                    ));
                 }
 
                 // deserialize entry
-                let entry: WALEntry<K, V> =
-                    match bincode::decode_from_slice(entry_bytes, bincode::config::standard()) {
-                        Ok((e, _)) => e,
-                        Err(err) => return Err(anyhow!("decode entry failed: {}", err)),
-                    };
+                let (entry, _): (WALEntry<K, V>, usize) =
+                    bincode::decode_from_slice(entry_bytes, bincode::config::standard())?;
 
                 // apply to mem
                 // release and reacquire mem.write() each entry, so if some other task had access to mem at the same time, it could read a partially‑recovered state.
@@ -167,7 +211,11 @@ where
             }
         }
 
-        Ok(KVLog { mem, log })
+        Ok(KVLog {
+            mem,
+            log,
+            _file_lock,
+        })
     }
 }
 
@@ -192,10 +240,10 @@ where
 
     /// set_with_flush does write and fsync per each entry
     ///
-    /// this is slow but provides a guarantee that data is durable.
+    /// this is slow but provides a strong guarantee that each entry is durable.
     /// flush returns only after WAL is fsync’d, so data survives crashes after set returns.
     /// Reads may see the old value until flush() completes
-    async fn set_with_flush(&self, key: K, value: V) -> Result<Option<V>, anyhow::Error> {
+    async fn set_with_flush(&self, key: K, value: V) -> Result<Option<V>, KVLogError> {
         // create a log entry
         let entry = WALEntry::Set {
             key: key.clone(),
@@ -203,12 +251,9 @@ where
         };
 
         // encode the log entry into raw bytes
-        let encoded =
-            bincode::encode_to_vec(entry, bincode::config::standard())?;
+        let encoded = bincode::encode_to_vec(entry, bincode::config::standard())?;
         // make sure the encoded entry len is u32 so that load() can use 4 bytes as the framing
-        let prefix_len: u32 = encoded
-            .len()
-            .try_into()?;
+        let prefix_len: u32 = encoded.len().try_into()?;
         // generate CRC32 checksum
         let checksum = crc32(&*encoded);
         let checksum_bytes = checksum.to_le_bytes();
@@ -247,11 +292,14 @@ where
 
     /// set_without_flush only appends to WAL(in the OS buffer) and updates the mem, but does not fsync
     ///
-    /// this is faster than set_with_flush but not durable so any unflushed data in os buffer will be lost on crashing or power loss.
+    /// this is faster than set_with_flush but not durable so any unflushed data in os buffer can be lost on crashing or power loss.
     /// OS buffer will automatically flush but could be at any time, it is not deterministic
     /// call manual_flush() to batch flush all prior writes in the os buffer to disk.
-    async fn set_without_flush(&self, key: K, value: V) -> Result<Option<V>, anyhow::Error> {
-        let entry = WALEntry::Set {key: key.clone(), value: value.clone()};
+    async fn set_without_flush(&self, key: K, value: V) -> Result<Option<V>, KVLogError> {
+        let entry = WALEntry::Set {
+            key: key.clone(),
+            value: value.clone(),
+        };
 
         let encoded = bincode::encode_to_vec(entry, bincode::config::standard())?;
         let prefix_len: u32 = encoded.len().try_into()?;
@@ -271,23 +319,20 @@ where
     }
 
     // manual_flush does fsync to make all prior writes in the os buffer durable.
-    async fn manual_flush(&self) -> Result<(), anyhow::Error> {
+    async fn manual_flush(&self) -> Result<(), KVLogError> {
         let mut f = self.log.write().await;
         f.sync_all().await?;
 
         Ok(())
     }
 
-    async fn delete(&self, key: K) -> Result<V, anyhow::Error>{
+    async fn delete(&self, key: K) -> Result<V, KVLogError> {
         let entry: WALEntry<K, V> = WALEntry::Delete { key: key.clone() };
 
         // encode the log entry into raw bytes
-        let encoded =
-            bincode::encode_to_vec(entry, bincode::config::standard())?;
+        let encoded = bincode::encode_to_vec(entry, bincode::config::standard())?;
         // make sure the encoded entry len is u32 so that load() can use 4 bytes as the framing
-        let len_prefix: u32 = encoded
-            .len()
-            .try_into()?;
+        let len_prefix: u32 = encoded.len().try_into()?;
         // generate CRC32 checksum
         let checksum = crc32(&*encoded);
         let checksum_bytes = checksum.to_le_bytes();
@@ -302,7 +347,9 @@ where
             f.sync_all().await?;
 
             let mut mem = self.mem.write().await;
-            mem.remove(&key).ok_or(anyhow!("delete failed: key not found"))
+            mem.remove(&key).ok_or(KVLogError::KeyNotFound {
+                msg: "delete failed: key not found".to_string(),
+            })
         }
     }
 }
@@ -317,7 +364,7 @@ where
 // - extra bonus: thoughts on the interface (e.g. trait_variant, non-mut get and delete, return value on set, etc.)
 #[cfg(test)]
 mod tests {
-    use crate::{KVLog, KVStore, crc32};
+    use crate::{crc32, KVLog, KVStore};
     use std::collections::HashSet;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -448,13 +495,20 @@ mod tests {
 
         // new key set will return None which is the old value
         let mut set_result = log.set_with_flush(key.clone(), v1.clone()).await;
-        assert!(set_result.unwrap().is_none(), "set should return old value aka None");
+        assert!(
+            set_result.unwrap().is_none(),
+            "set should return old value aka None"
+        );
 
         get_result = log.get(key.clone()).await;
         assert_eq!(get_result, Some(v1.clone()), "get should return value bar");
 
         set_result = log.set_with_flush(key.clone(), v2.clone()).await;
-        assert_eq!(set_result.unwrap(), Some(v1), "set should return old value aka bar");
+        assert_eq!(
+            set_result.unwrap(),
+            Some(v1),
+            "set should return old value aka bar"
+        );
 
         get_result = log.get(key.clone()).await;
         assert_eq!(get_result, Some(v2), "get should return new value aha");
@@ -678,12 +732,8 @@ mod tests {
     //       - WAL compaction / snapshotting to cap log growth.
     //       - Backpressure or size limits to avoid disk exhaustion.
     //   - Operational safety
-    //       - File locking to prevent multi‑process writers.
-    //       - Safe open modes and permissions.
+    //       - File locking to prevent multi‑process writers. Impl done, need multi-processes tests
     //       - Metrics/logging for errors and latency.
-    //   - Performance
-    //       - Reduce fsync frequency (group commit).
-    //       - Avoid holding WAL lock during long operations if possible.
     //   - Testing
     //       - Fuzz WAL decode.
     //       - Property tests for ordering & idempotence.
@@ -691,4 +741,5 @@ mod tests {
     //   - Documentation
     //       - Explicit guarantees (durability, consistency, concurrency).
     //       - Known limitations (e.g., single‑process only).
+    //   - make it a lib
 }
