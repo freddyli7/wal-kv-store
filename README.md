@@ -1,4 +1,4 @@
-# Spire Take-home Assignment
+# Write Ahead Log KVStore
 
 Given the provided trait representing a key-value store, implement a struct KVLog that implements KVStore with the properties:
 - reentrant (when shared across either threads or async tasks)

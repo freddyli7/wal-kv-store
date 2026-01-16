@@ -1,4 +1,4 @@
-use anyhow::anyhow;
+use anyhow::{anyhow, Error};
 use bincode::{Decode, Encode};
 use crc32fast::Hasher;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -22,7 +22,9 @@ where
     V: Serialize + DeserializeOwned + Send + Sync,
 {
     async fn get(&self, key: K) -> Option<V>;
-    async fn set(&self, key: K, value: V) -> Result<Option<V>, anyhow::Error>;
+    async fn set_with_flush(&self, key: K, value: V) -> Result<Option<V>, anyhow::Error>;
+    async fn set_without_flush(&self, key: K, value: V) -> Result<Option<V>, anyhow::Error>;
+    async fn manual_flush(&self) -> Result<(), anyhow::Error>;
     async fn delete(&self, key: K) -> Result<V, anyhow::Error>;
 }
 
@@ -66,6 +68,24 @@ where
     K: Hash + Eq + bincode::Encode + bincode::Decode<()>,
     V: bincode::Encode + bincode::Decode<()>,
 {
+    /// load will initialize a KVLog from the given path or creating a new one if it does not exist.
+    /// During loading, no reading or writing is allowed.
+    ///
+    /// The data structure here in WAL is:
+    /// [4 bytes prefix-length][4 bytes checksum][encoded entry][4 bytes prefix-length][4 bytes checksum][encoded entry]...[4 bytes prefix-length][4 bytes checksum][encoded entry]
+    /// 4 bytes is the length prefix of each entry
+    /// entries are encoded using bincode
+    ///
+    /// example:
+    /// SET(1,2) -> encode -> [5f,12,42,43,56,22,44] -> len([5f,12,42,43,56,22,44]) -> [01,02,03,04] -> [01,02,03,04] is the len of the entry ->
+    /// CRC32 checksum: [5f,12,42,43,56,22,44] -> [aa,bb,cc,dd]
+    /// write into WAL will be [len][checksum][payload]: [01,02,03,04,aa,bb,cc,dd,5f,12,42,43,56,22,44]
+    /// DELETE(1) -> encode -> [1c,3a,4b,11,25,54,65] -> len([1c,3a,4b,11,25,54,65]) -> [00,00,00,1a] -> [00,00,00,1a] is the len of the entry ->
+    /// CRC32 checksum: [1c,3a,4b,11,25,54,65] -> [ff,aa,33,aa]
+    /// write into WAL will be [len][checksum][payload]: [00,00,00,1a,ff,aa,33,aa,1c,3a,4b,11,25,54,65]
+    /// so WAL will be stored like: [01,02,03,04,aa,bb,cc,dd,5f,12,42,43,56,22,44,00,00,00,1a,ff,aa,33,aa,1c,3a,4b,11,25,54,65] which represent two entries:
+    /// SET(1,2)
+    /// DELETE(1)
     pub async fn load(path: &str) -> anyhow::Result<Self> {
         // open WAL or create one if missing
         let file = OpenOptions::new()
@@ -79,7 +99,6 @@ where
         let mem = Arc::new(RwLock::new(HashMap::new()));
 
         // recover
-        // no write is allowed when recovering
         {
             // log lock: currency read but exclusive write
             let mut f = log.write().await;
@@ -88,22 +107,6 @@ where
             // load everything in WAL into buffer
             let mut buf = Vec::new();
             f.read_to_end(&mut buf).await?;
-
-            // The data structure here in WAL is:
-            // [4 bytes prefix-length][4 bytes checksum][encoded entry][4 bytes prefix-length][4 bytes checksum][encoded entry]...[4 bytes prefix-length][4 bytes checksum][encoded entry]
-            // 4 bytes is the length prefix of each entry
-            // entries are encoded using bincode
-            //
-            // example:
-            // SET(1,2) -> encode -> [5f,12,42,43,56,22,44] -> len([5f,12,42,43,56,22,44]) -> [01,02,03,04] -> [01,02,03,04] is the len of the entry ->
-            // CRC32 checksum: [5f,12,42,43,56,22,44] -> [aa,bb,cc,dd]
-            // write into WAL will be [len][checksum][payload]: [01,02,03,04,aa,bb,cc,dd,5f,12,42,43,56,22,44]
-            // DELETE(1) -> encode -> [1c,3a,4b,11,25,54,65] -> len([1c,3a,4b,11,25,54,65]) -> [00,00,00,1a] -> [00,00,00,1a] is the len of the entry ->
-            // CRC32 checksum: [1c,3a,4b,11,25,54,65] -> [ff,aa,33,aa]
-            // write into WAL will be [len][checksum][payload]: [00,00,00,1a,ff,aa,33,aa,1c,3a,4b,11,25,54,65]
-            // so WAL will be stored like: [01,02,03,04,aa,bb,cc,dd,5f,12,42,43,56,22,44,00,00,00,1a,ff,aa,33,aa,1c,3a,4b,11,25,54,65] which represent two entries:
-            // SET(1,2)
-            // DELETE(1)
 
             let mut cursor = &buf[..]; // can also be &buf
             while cursor.len() >= 4 {
@@ -133,6 +136,7 @@ where
                 let (entry_bytes, next) = rest.split_at(len_prefix);
                 let recomputed_checksum = crc32(entry_bytes);
 
+                // CRC32 checksum verification for each entry loaded
                 if loaded_checksum != recomputed_checksum {
                     return Err(anyhow!("load entry failed: entry checksum mismatch"));
                 }
@@ -180,12 +184,18 @@ where
         + Hash,
     V: Serialize + DeserializeOwned + Send + Sync + bincode::Encode + bincode::Decode<()> + Clone,
 {
+    /// get returns the value associated with the given key, or None if the key does not exist.
     async fn get(&self, key: K) -> Option<V> {
         let read_guard = self.mem.read().await;
         read_guard.get(&key).cloned()
     }
 
-    async fn set(&self, key: K, value: V) -> Result<Option<V>, anyhow::Error> {
+    /// set_with_flush does write and fsync per each entry
+    ///
+    /// this is slow but provides a guarantee that data is durable.
+    /// flush returns only after WAL is fsync’d, so data survives crashes after set returns.
+    /// Reads may see the old value until flush() completes
+    async fn set_with_flush(&self, key: K, value: V) -> Result<Option<V>, anyhow::Error> {
         // create a log entry
         let entry = WALEntry::Set {
             key: key.clone(),
@@ -231,8 +241,41 @@ where
             // any readers trying to acquire mem.read() will block until the writer releases that lock.
             let mut mem = self.mem.write().await;
             // HashMap insert API: if key not exist, return None, otherwise return old value
-            anyhow::Ok(mem.insert(key, value))
+            Ok(mem.insert(key, value))
         }
+    }
+
+    /// set_without_flush only appends to WAL(in the OS buffer) and updates the mem, but does not fsync
+    ///
+    /// this is faster than set_with_flush but not durable so any unflushed data in os buffer will be lost on crashing or power loss.
+    /// OS buffer will automatically flush but could be at any time, it is not deterministic
+    /// call manual_flush() to batch flush all prior writes in the os buffer to disk.
+    async fn set_without_flush(&self, key: K, value: V) -> Result<Option<V>, anyhow::Error> {
+        let entry = WALEntry::Set {key: key.clone(), value: value.clone()};
+
+        let encoded = bincode::encode_to_vec(entry, bincode::config::standard())?;
+        let prefix_len: u32 = encoded.len().try_into()?;
+        let checksum = crc32(&*encoded);
+        let checksum_bytes = checksum.to_le_bytes();
+        let mut to_write = prefix_len.to_le_bytes().to_vec();
+        to_write.extend(checksum_bytes);
+        to_write.extend(encoded);
+
+        {
+            let mut f = self.log.write().await;
+            f.write_all(&to_write).await?;
+
+            let mut mem = self.mem.write().await;
+            Ok(mem.insert(key, value))
+        }
+    }
+
+    // manual_flush does fsync to make all prior writes in the os buffer durable.
+    async fn manual_flush(&self) -> Result<(), anyhow::Error> {
+        let mut f = self.log.write().await;
+        f.sync_all().await?;
+
+        Ok(())
     }
 
     async fn delete(&self, key: K) -> Result<V, anyhow::Error>{
@@ -404,13 +447,13 @@ mod tests {
         assert!(get_result.is_none(), "get should return None before set");
 
         // new key set will return None which is the old value
-        let mut set_result = log.set(key.clone(), v1.clone()).await;
+        let mut set_result = log.set_with_flush(key.clone(), v1.clone()).await;
         assert!(set_result.unwrap().is_none(), "set should return old value aka None");
 
         get_result = log.get(key.clone()).await;
         assert_eq!(get_result, Some(v1.clone()), "get should return value bar");
 
-        set_result = log.set(key.clone(), v2.clone()).await;
+        set_result = log.set_with_flush(key.clone(), v2.clone()).await;
         assert_eq!(set_result.unwrap(), Some(v1), "set should return old value aka bar");
 
         get_result = log.get(key.clone()).await;
@@ -519,7 +562,7 @@ mod tests {
                 for r in 0..rounds {
                     let key = format!("k{}_{}", w, r);
                     let value = format!("v{}_{}", w, r);
-                    log.set(key, value).await;
+                    log.set_with_flush(key, value).await;
                     if w == 0 && r < deletes {
                         let delete_key = format!("k{}_{}", w, r);
                         log.delete(delete_key).await;
@@ -618,19 +661,19 @@ mod tests {
 
     // production ready:
     // - Crash safety
-    //       - Handle partial/torn WAL entries without panic - return error and let the caller decide what to do.
-    //       - Checksums or CRC per entry to detect corruption. [prefix-length][checksum][payload]
+    //       - Handle partial/torn WAL entries without panic - return error and let the caller decide what to do. Done
+    //       - Checksums or CRC per entry to detect corruption. [prefix-length][checksum][payload] Done
     //       - Recovery tests for mid‑write crashes.
     //   - Error handling
     //       - No expect in core paths; return typed errors. Done
     //       - Propagate fsync / IO errors to callers. Done
     //   - Durability semantics
-    //       - Clear guarantees (fsync policy, when writes are visible).
-    //       - Optional batched/async flush mode with explicit flush().
+    //       - Clear guarantees (fsync policy, when writes are visible). Document
+    //       - Optional batched/async flush mode with explicit flush(). Done
     //   - Concurrency & correctness
-    //       - Strict ordering guarantees (documented).
+    //       - Strict ordering guarantees. Write is strictly ordered, read is not. Done
     //       - Tests for concurrent writers/readers/deletes across threads.
-    //       - Defined behavior for read‑your‑write and visibility.
+    //       - Defined behavior for read‑your‑write and visibility. Done
     //   - Resource management
     //       - WAL compaction / snapshotting to cap log growth.
     //       - Backpressure or size limits to avoid disk exhaustion.
