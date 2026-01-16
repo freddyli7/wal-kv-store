@@ -1,7 +1,7 @@
 use bincode::{Decode, Encode};
 use crc32fast::Hasher;
 use fs2::FileExt;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::HashMap;
 use std::fs::OpenOptions as std_OpenOptions;
 use std::hash::Hash;
@@ -23,11 +23,11 @@ where
     K: Serialize + DeserializeOwned + Send + Sync,
     V: Serialize + DeserializeOwned + Send + Sync,
 {
-    async fn get(&self, key: K) -> Option<V>;
+    async fn get(&self, key: K) -> Result<Option<V>, KVLogError>;
     async fn set_with_flush(&self, key: K, value: V) -> Result<Option<V>, KVLogError>;
     async fn set_without_flush(&self, key: K, value: V) -> Result<Option<V>, KVLogError>;
     async fn manual_flush(&self) -> Result<(), KVLogError>;
-    async fn delete(&self, key: K) -> Result<V, KVLogError>;
+    async fn delete(&self, key: K) -> Result<Option<V>, KVLogError>;
 }
 
 // implement a version of struct KVLog that implements KVStore with the properties:
@@ -233,9 +233,9 @@ where
     V: Serialize + DeserializeOwned + Send + Sync + bincode::Encode + bincode::Decode<()> + Clone,
 {
     /// get returns the value associated with the given key, or None if the key does not exist.
-    async fn get(&self, key: K) -> Option<V> {
+    async fn get(&self, key: K) -> Result<Option<V>, KVLogError> {
         let read_guard = self.mem.read().await;
-        read_guard.get(&key).cloned()
+        Ok(read_guard.get(&key).cloned())
     }
 
     /// set_with_flush does write and fsync per each entry
@@ -320,13 +320,19 @@ where
 
     // manual_flush does fsync to make all prior writes in the os buffer durable.
     async fn manual_flush(&self) -> Result<(), KVLogError> {
-        let mut f = self.log.write().await;
+        let f = self.log.write().await;
         f.sync_all().await?;
 
         Ok(())
     }
 
-    async fn delete(&self, key: K) -> Result<V, KVLogError> {
+    /// delete removes the key from the store.
+    /// if key not present, return Ok(None) without entry log, but this is not an error.
+    /// trade-offs: readers are blocked during the fsync because you hold mem.write() while flushing
+    /// readers are blocked longer than set_with_flush
+    /// No WAL entry for missing keys.
+    /// Durability before visibility
+    async fn delete(&self, key: K) -> Result<Option<V>, KVLogError> {
         let entry: WALEntry<K, V> = WALEntry::Delete { key: key.clone() };
 
         // encode the log entry into raw bytes
@@ -343,13 +349,19 @@ where
 
         {
             let mut f = self.log.write().await;
+
+            // check if the key exists
+            let mut mem_lock = self.mem.write().await;
+            if mem_lock.get(&key).is_none() {
+                // key not exist, return without entry log, but this is not an error
+                return Ok(None);
+            }
+
             f.write_all(&to_write).await?;
             f.sync_all().await?;
 
-            let mut mem = self.mem.write().await;
-            mem.remove(&key).ok_or(KVLogError::KeyNotFound {
-                msg: "delete failed: key not found".to_string(),
-            })
+            let re = mem_lock.remove(&key);
+            Ok(re)
         }
     }
 }
@@ -364,7 +376,7 @@ where
 // - extra bonus: thoughts on the interface (e.g. trait_variant, non-mut get and delete, return value on set, etc.)
 #[cfg(test)]
 mod tests {
-    use crate::{crc32, KVLog, KVStore};
+    use crate::{KVLog, KVStore, crc32};
     use std::collections::HashSet;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -491,7 +503,11 @@ mod tests {
         let v2 = "aha".to_string();
 
         let mut get_result = log.get(key.clone()).await;
-        assert!(get_result.is_none(), "get should return None before set");
+        assert_eq!(
+            get_result.unwrap(),
+            None,
+            "get should return None before set"
+        );
 
         // new key set will return None which is the old value
         let mut set_result = log.set_with_flush(key.clone(), v1.clone()).await;
@@ -501,7 +517,11 @@ mod tests {
         );
 
         get_result = log.get(key.clone()).await;
-        assert_eq!(get_result, Some(v1.clone()), "get should return value bar");
+        assert_eq!(
+            get_result.unwrap(),
+            Some(v1.clone()),
+            "get should return value bar"
+        );
 
         set_result = log.set_with_flush(key.clone(), v2.clone()).await;
         assert_eq!(
@@ -511,11 +531,15 @@ mod tests {
         );
 
         get_result = log.get(key.clone()).await;
-        assert_eq!(get_result, Some(v2), "get should return new value aha");
+        assert_eq!(
+            get_result.unwrap(),
+            Some(v2),
+            "get should return new value aha"
+        );
 
         log.delete(key.clone()).await;
         assert!(
-            log.get(key).await.is_none(),
+            log.get(key).await.unwrap().is_none(),
             "get should return None after delete"
         );
     }
@@ -553,8 +577,11 @@ mod tests {
 
         let log = setup(log_path.to_str().expect("log path is not valid UTF-8")).await;
 
-        assert_eq!(log.get("a".to_string()).await, Some("3".to_string()));
-        assert_eq!(log.get("b".to_string()).await, None);
+        assert_eq!(
+            log.get("a".to_string()).await.unwrap(),
+            Some("3".to_string())
+        );
+        assert_eq!(log.get("b".to_string()).await.unwrap(), None);
 
         let read_back = read_wal_entries(&log).await;
         assert_eq!(read_back.len(), entries.len());
@@ -649,9 +676,9 @@ mod tests {
                 let key = format!("k{}_{}", w, r);
                 let expected = format!("v{}_{}", w, r);
                 if w == 0 && r < deletes {
-                    assert_eq!(log.get(key).await, None);
+                    assert_eq!(log.get(key).await.unwrap(), None);
                 } else {
-                    assert_eq!(log.get(key).await, Some(expected));
+                    assert_eq!(log.get(key).await.unwrap(), Some(expected));
                 }
             }
         }
@@ -733,7 +760,7 @@ mod tests {
     //       - Backpressure or size limits to avoid disk exhaustion.
     //   - Operational safety
     //       - File locking to prevent multi‑process writers. Impl done, need multi-processes tests
-    //       - Metrics/logging for errors and latency.
+    //       - Define KVLogError type Done
     //   - Testing
     //       - Fuzz WAL decode.
     //       - Property tests for ordering & idempotence.
