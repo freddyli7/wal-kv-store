@@ -1,11 +1,11 @@
-use crate::KVLogError;
-use crate::KVStore;
 use crate::lock::acquire_file_lock;
 use crate::wal::{
-    CHECKSUM_LEN, ENTRY_PREFIX_LEN, MAX_ENTRY_SIZE, WALEntry, crc32, parse_prefix_bytes,
+    crc32, parse_prefix_bytes, WALEntry, CHECKSUM_LEN, ENTRY_PREFIX_LEN, MAX_ENTRY_SIZE,
 };
-use serde::Serialize;
+use crate::KVLogError;
+use crate::KVStore;
 use serde::de::DeserializeOwned;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::io::SeekFrom;
@@ -233,6 +233,7 @@ where
 
             // write_all writes to the OS buffer; it guarantees the bytes are handed to the kernel, not that they’re on disk.
             // sync_all (fsync) asks the OS to flush those buffers to stable storage.
+            // write_all puts bytes into the OS page cache; they’re visible if you read the file, but not guaranteed durable. Only sync_all/fsync makes a persistence guarantee.
             f.sync_all().await?;
 
             // acquire write lock of mem
@@ -330,7 +331,7 @@ where
 // - extra bonus: thoughts on the interface (e.g. trait_variant, non-mut get and delete, return value on set, etc.)
 #[cfg(test)]
 mod tests {
-    use crate::{KVLog, KVStore, wal::crc32};
+    use crate::{wal::crc32, KVLog, KVStore};
     use std::collections::HashSet;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -714,5 +715,4 @@ mod tests {
     //   - Documentation
     //       - Explicit guarantees (durability, consistency, concurrency).
     //       - Known limitations (e.g., single‑process only).
-    // how to use this KVLog
 }

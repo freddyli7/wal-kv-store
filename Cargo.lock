@@ -159,6 +159,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "kv-log"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "crc32fast",
+ "fs2",
+ "futures",
+ "serde",
+ "thiserror",
+ "tokio",
+ "trait-variant",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.180"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -407,20 +421,6 @@ name = "virtue"
 version = "0.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "051eb1abcf10076295e815102942cc58f9d5e3b4560e46e53c21e8ff6f3af7b1"
-
-[[package]]
-name = "wal-kv-log"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "crc32fast",
- "fs2",
- "futures",
- "serde",
- "thiserror",
- "tokio",
- "trait-variant",
-]
 
 [[package]]
 name = "wasi"

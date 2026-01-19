@@ -13,4 +13,3 @@ mod wal;
 pub use error::KVLogError;
 pub use kvlog::KVLog;
 pub use traits::KVStore;
-pub use traits::LocalKVStore;

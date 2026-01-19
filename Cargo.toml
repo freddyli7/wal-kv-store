@@ -1,5 +1,5 @@
 [package]
-name = "wal-kv-log"
+name = "kv-log"
 version = "0.1.0"
 edition = "2024"
 
