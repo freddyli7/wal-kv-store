@@ -31,12 +31,12 @@ where
 }
 
 // implement a version of struct KVLog that implements KVStore with the properties:
-// - reentrant (when shared across either threads or async tasks)
-// - backed by a log (filesystem is sufficient for this purpose)
-// - persistence is guaranteed before access (e.g. Write Ahead Log or equivalent guarantee) = durability before visibility
+// - reentrant (when shared across either threads or async tasks) - concurrent access to the same KVLog instance is safe
+// - backed by a log (filesystem is enough for this purpose)
+// - persistence is guaranteed before access (e.g. Write Ahead Log or equivalent guarantee) = durability before visibility - a single‑writer append‑only WAL(concurrent writers at the API level, but a single writer at the WAL I/O level)
 // - will load the persisted state on startup
 pub struct KVLog<K, V> {
-    // RwLock:
+    // RwLock: one write lock or multiple read locks at a time
     // Writer lock held → no reads, no other writes;
     // Read lock held → any number of reads, no write and writers must wait until all readers release their lock;
     // No lock → any number of reads or a single writer
@@ -71,6 +71,8 @@ pub enum KVLogError {
 }
 
 const MAX_ENTRY_SIZE: usize = 1024 * 1024; // 1 MiB, adjust as needed
+const ENTRY_PREFIX_LEN: usize = 4;
+const CHECKSUM_LEN: usize = 4;
 
 fn acquire_file_lock(p: &str) -> Result<std::fs::File, KVLogError> {
     let path = std::path::Path::new(p);
@@ -142,7 +144,8 @@ where
 
         // recover
         {
-            // log lock: currency read but exclusive write
+            // log lock: currency read but exclusive write lock
+            // now write lock is acquired, so no other reads nor writes are allowed until this lock is released.
             let mut f = log.write().await;
             f.seek(SeekFrom::Start(0)).await?;
 
@@ -150,47 +153,60 @@ where
             let mut buf = Vec::new();
             f.read_to_end(&mut buf).await?;
 
+            // the cumulative size of the valid entry in WAL, used to truncate the WAL file to the size that excludes the partial entry at the end.
+            let mut offset = 0usize;
             let mut cursor = &buf[..]; // can also be &buf
-            while cursor.len() >= 4 {
+            while cursor.len() >= ENTRY_PREFIX_LEN {
                 // read length prefix, consistently make it 4 bytes which is u32 regardless the arch(could be 8 bytes if u64)
-                let (len_prefix_bytes, rest) = cursor.split_at(4);
+                let (payload_len_bytes, rest) = cursor.split_at(ENTRY_PREFIX_LEN);
 
                 // this will eliminate the unwrap() so that make this production ready:
                 // original: let len_prefix = u32::from_le_bytes(len_prefix_bytes.try_into().unwrap()) as usize;
-                let len_prefix = parse_prefix_bytes(len_prefix_bytes)? as usize;
-                if len_prefix > MAX_ENTRY_SIZE {
+                let payload_len = parse_prefix_bytes(payload_len_bytes)? as usize;
+                if payload_len > MAX_ENTRY_SIZE {
                     return Err(KVLogError::InvalidPrefix {
                         msg: format!(
                             "load entry failed: entry prefix too large: {} > {}",
-                            len_prefix, MAX_ENTRY_SIZE
+                            payload_len, MAX_ENTRY_SIZE
                         ),
                     });
                 }
 
-                // check of partial entry (crash safe)
-                if rest.len() < 4 + len_prefix {
-                    return Err(KVLogError::CorruptWal(
-                        "load entry failed: truncated entry detected".to_string(),
-                    ));
+                // check of partial entry (crash safe). Partial entries should only appear at the end bcs this is a single writer append only WAL.
+                // 4 represents the length of the CRC32 checksum,
+                // so, the minimum length of a valid entry should be > CHECKSUM_LEN + payload_len
+                if rest.len() < CHECKSUM_LEN + payload_len {
+                    // ignore the partial entry as it is the end of the WAL
+                    break;
                 }
 
-                let (checksum_bytes, rest) = rest.split_at(4);
+                let (checksum_bytes, rest) = rest.split_at(CHECKSUM_LEN);
                 let loaded_checksum = parse_prefix_bytes(checksum_bytes)?;
 
                 // read entry
-                let (entry_bytes, next) = rest.split_at(len_prefix);
-                let recomputed_checksum = crc32(entry_bytes);
+                let (payload_bytes, next) = rest.split_at(payload_len);
+                let recomputed_checksum = crc32(payload_bytes);
 
                 // CRC32 checksum verification for each entry loaded
+                // this is to make sure the entry is not corrupted
+                // in the case that the last entry is corrupted and still with correct prefix length and payload bytes size, it will pass the size check: rest.len() < CHECKSUM_LEN + len_prefix
+                // but, it is a partial entry so we should not return error here, we should treat it the same way as the torn tail.
                 if loaded_checksum != recomputed_checksum {
-                    return Err(KVLogError::CorruptWal(
-                        "load entry failed: entry checksum mismatch".to_string(),
-                    ));
+                    // there are still bytes remaining, so checksum mismatch happens in the middle, we are sure that the WAL is corrupted
+                    if next.len() > 0 {
+                        return Err(KVLogError::CorruptWal(
+                            "load entry failed: entry checksum mismatch".to_string(),
+                        ));
+                    } else {
+                        // no more bytes remain, so the checksum mismatch must mean the torn entry at the end
+                        // handle it by ignoring the partial entry at the end
+                        break;
+                    }
                 }
 
                 // deserialize entry
                 let (entry, _): (WALEntry<K, V>, usize) =
-                    bincode::decode_from_slice(entry_bytes, bincode::config::standard())?;
+                    bincode::decode_from_slice(payload_bytes, bincode::config::standard())?;
 
                 // apply to mem
                 // release and reacquire mem.write() each entry, so if some other task had access to mem at the same time, it could read a partially‑recovered state.
@@ -207,10 +223,17 @@ where
                     }
                 }
 
+                // add up each valid entry size
+                // this will ignore the partial entry at the end
+                offset += ENTRY_PREFIX_LEN + CHECKSUM_LEN + payload_len;
+
                 cursor = next;
             }
+            // Truncates or extends the underlying file, updating the size of this file to become size.
+            f.set_len(offset as u64).await?;
         }
 
+        // only the recovering id completed and KVLog is returned from here, other thread can acquire the mem lock
         Ok(KVLog {
             mem,
             log,
@@ -232,7 +255,8 @@ where
         + Hash,
     V: Serialize + DeserializeOwned + Send + Sync + bincode::Encode + bincode::Decode<()> + Clone,
 {
-    /// get returns the value associated with the given key, or None if the key does not exist.
+    /// get returns the value associated with the given key -> Ok(Some(value)), or Ok(None) if the key does not exist.
+    /// KVLogError for any error
     async fn get(&self, key: K) -> Result<Option<V>, KVLogError> {
         let read_guard = self.mem.read().await;
         Ok(read_guard.get(&key).cloned())
@@ -241,8 +265,8 @@ where
     /// set_with_flush does write and fsync per each entry
     ///
     /// this is slow but provides a strong guarantee that each entry is durable.
-    /// flush returns only after WAL is fsync’d, so data survives crashes after set returns.
-    /// Reads may see the old value until flush() completes
+    /// flush returns only after WAL is fsync’d, so data survives crashes after set_with_flush returns.
+    /// Reads may see the old value until set_with_flush completes
     async fn set_with_flush(&self, key: K, value: V) -> Result<Option<V>, KVLogError> {
         // create a log entry
         let entry = WALEntry::Set {
@@ -261,6 +285,7 @@ where
         let mut to_write = prefix_len.to_le_bytes().to_vec();
         // extend() takes any iterator/collection and appends its items. It moves the encoded.
         // append() specifically takes &mut Vec<T>, moves all items, and empties the source vec so that encoded still exists but just empty.
+        // data structure: [prefix_len][checksum][encoded]
         to_write.extend(checksum_bytes);
         to_write.extend(encoded);
 
@@ -277,6 +302,13 @@ where
             f.write_all(&to_write).await?;
             // A crash or power loss during write_all or before sync_all can leave a partial entry
             // e.g., length prefix is written but not the full payload
+            // partial entries should only appear at the end
+
+            // If the crash happens before write_all starts, then no new bytes are written — no partial entry.
+            // If the crash happens during write_all, you can get a partial entry.
+            // If it happens after write_all but before sync_all, the entry might be fully in the OS page cache but not durable; after restart it may be missing or partially written, depending on what
+            // actually reached disk.
+
             // write_all writes to the OS buffer; it guarantees the bytes are handed to the kernel, not that they’re on disk.
             // sync_all (fsync) asks the OS to flush those buffers to stable storage.
             f.sync_all().await?;
@@ -328,10 +360,10 @@ where
 
     /// delete removes the key from the store.
     /// if key not present, return Ok(None) without entry log, but this is not an error.
-    /// trade-offs: readers are blocked during the fsync because you hold mem.write() while flushing
-    /// readers are blocked longer than set_with_flush
+    /// Trade-offs: readers are blocked during the fsync because you hold mem.write() while flushing.
+    /// Readers in delete are blocked longer than they are in set_with_flush if the key presents.
     /// No WAL entry for missing keys.
-    /// Durability before visibility
+    /// Durability before visibility.
     async fn delete(&self, key: K) -> Result<Option<V>, KVLogError> {
         let entry: WALEntry<K, V> = WALEntry::Delete { key: key.clone() };
 
