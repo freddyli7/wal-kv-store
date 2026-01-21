@@ -16,6 +16,7 @@ where
     async fn get(&self, key: K) -> Result<Option<V>, KVLogError>;
     async fn set_with_flush(&self, key: K, value: V) -> Result<Option<V>, KVLogError>;
     async fn set_without_flush(&self, key: K, value: V) -> Result<Option<V>, KVLogError>;
+    async fn delete_with_flush(&self, key: K) -> Result<Option<V>, KVLogError>;
+    async fn delete_without_flush(&self, key: K) -> Result<Option<V>, KVLogError>;
     async fn flush(&self) -> Result<(), KVLogError>;
-    async fn delete(&self, key: K) -> Result<Option<V>, KVLogError>;
 }

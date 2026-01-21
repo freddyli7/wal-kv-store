@@ -247,9 +247,9 @@ where
 
     /// set_without_flush only appends to WAL(in the OS buffer) and updates the mem, but does not fsync
     ///
-    /// this is faster than set_with_flush but not durable so any unflushed data in os buffer can be lost on crashing or power loss.
+    /// this is faster than set_with_flush but not durable, so any unflushed data in os buffer can be lost on crashing or power loss.
     /// OS buffer will automatically flush but could be at any time, it is not deterministic
-    /// call manual_flush() to batch flush all prior writes in the os buffer to disk.
+    /// call flush() to batch flush all prior writes in the os buffer to disk.
     async fn set_without_flush(&self, key: K, value: V) -> Result<Option<V>, KVLogError> {
         let entry = WALEntry::Set {
             key: key.clone(),
@@ -273,21 +273,13 @@ where
         }
     }
 
-    // flush does manual fsync to make all prior writes in the os buffer durable.
-    async fn flush(&self) -> Result<(), KVLogError> {
-        let f = self.log.write().await;
-        f.sync_all().await?;
-
-        Ok(())
-    }
-
-    /// delete removes the key from the store.
+    /// delete_with_flush appends the operation to log and removes the key from the mem
     /// if key not present, return Ok(None) without entry log, but this is not an error.
     /// Trade-offs: readers are blocked during the fsync because you hold mem.write() while flushing.
     /// Readers in delete are blocked longer than they are in set_with_flush if the key presents.
     /// No WAL entry for missing keys.
     /// Durability before visibility.
-    async fn delete(&self, key: K) -> Result<Option<V>, KVLogError> {
+    async fn delete_with_flush(&self, key: K) -> Result<Option<V>, KVLogError> {
         let entry: WALEntry<K, V> = WALEntry::Delete { key: key.clone() };
 
         // encode the log entry into raw bytes
@@ -318,6 +310,48 @@ where
             let re = mem_lock.remove(&key);
             Ok(re)
         }
+    }
+
+    /// delete_without_flush only appends to WAL(in the OS buffer) and updates the mem, but does not fsync
+    ///
+    /// this is faster than delete_with_flush but not durable, so any unflushed data in os buffer can be lost on crashing or power loss.
+    /// OS buffer will automatically flush but could be at any time, it is not deterministic
+    /// call flush() to batch flush all prior writes in the os buffer to disk.
+    async fn delete_without_flush(&self, key: K) -> Result<Option<V>, KVLogError> {
+        let entry: WALEntry<_, V> = WALEntry::Delete { key: key.clone() };
+
+        let encoded = bincode::encode_to_vec(entry, bincode::config::standard())?;
+        let len_prefix: u32 = encoded.len().try_into()?;
+
+        // generate CRC32 checksum
+        let checksum = crc32(&*encoded);
+        let checksum_bytes = checksum.to_le_bytes();
+
+        let mut to_write = len_prefix.to_le_bytes().to_vec();
+        to_write.extend(checksum_bytes);
+        to_write.extend(encoded);
+
+        {
+            let mut f = self.log.write().await;
+
+            let mut mem_lock = self.mem.write().await;
+            if mem_lock.get(&key).is_none() {
+                return Ok(None);
+            }
+
+            f.write_all(&to_write).await?;
+
+            let re = mem_lock.remove(&key);
+            Ok(re)
+        }
+    }
+
+    // flush does manual fsync to make all prior writes in the os buffer durable.
+    async fn flush(&self) -> Result<(), KVLogError> {
+        let f = self.log.write().await;
+        f.sync_all().await?;
+
+        Ok(())
     }
 }
 
@@ -492,7 +526,7 @@ mod tests {
             "get should return new value aha"
         );
 
-        log.delete(key.clone()).await.unwrap();
+        log.delete_with_flush(key.clone()).await.unwrap();
         assert!(
             log.get(key).await.unwrap().is_none(),
             "get should return None after delete"
@@ -601,7 +635,7 @@ mod tests {
                     log.set_with_flush(key, value).await;
                     if w == 0 && r < deletes {
                         let delete_key = format!("k{}_{}", w, r);
-                        log.delete(delete_key).await;
+                        log.delete_with_flush(delete_key).await;
                     }
                 }
             });
