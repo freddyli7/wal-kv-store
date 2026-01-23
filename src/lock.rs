@@ -5,6 +5,9 @@ use std::fs::OpenOptions as std_OpenOptions;
 pub(crate) fn acquire_file_lock(p: &str) -> Result<std::fs::File, KVLogError> {
     let path = std::path::Path::new(p);
 
+    // this will create a file with .lock extension
+    // it is used for file lock between multiple processes
+    // a std::fs::OpenOptions is enough, no need for tokio::fs::OpenOptions
     let lock_path = path.with_extension("lock");
     let file = std_OpenOptions::new()
         .create(true)

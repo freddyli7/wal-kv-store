@@ -1,11 +1,11 @@
-use crate::lock::acquire_file_lock;
-use crate::wal::{
-    crc32, parse_prefix_bytes, WALEntry, CHECKSUM_LEN, ENTRY_PREFIX_LEN, MAX_ENTRY_SIZE,
-};
 use crate::KVLogError;
 use crate::KVStore;
-use serde::de::DeserializeOwned;
+use crate::lock::acquire_file_lock;
+use crate::wal::{
+    CHECKSUM_LEN, ENTRY_PREFIX_LEN, MAX_ENTRY_SIZE, WALEntry, crc32, parse_prefix_bytes,
+};
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::io::SeekFrom;
@@ -201,7 +201,7 @@ where
         // make sure the encoded entry len is u32 so that load() can use 4 bytes as the framing
         let prefix_len: u32 = encoded.len().try_into()?;
         // generate CRC32 checksum
-        let checksum = crc32(&*encoded);
+        let checksum = crc32(&*encoded); // todo: trait
         let checksum_bytes = checksum.to_le_bytes();
 
         let mut to_write = prefix_len.to_le_bytes().to_vec();
@@ -228,12 +228,14 @@ where
 
             // If the crash happens before write_all starts, then no new bytes are written — no partial entry.
             // If the crash happens during write_all, you can get a partial entry.
-            // If it happens after write_all but before sync_all, the entry might be fully in the OS page cache but not durable; after restart it may be missing or partially written, depending on what
+            // If it happens after write_all but before sync_all, the entry might be fully in the OS page cache but not durable;
+            // after restart it may be missing or partially written, depending on what
             // actually reached disk.
 
             // write_all writes to the OS buffer; it guarantees the bytes are handed to the kernel, not that they’re on disk.
             // sync_all (fsync) asks the OS to flush those buffers to stable storage.
-            // write_all puts bytes into the OS page cache; they’re visible if you read the file, but not guaranteed durable. Only sync_all/fsync makes a persistence guarantee.
+            // write_all puts bytes into the OS page cache; they’re visible if you read the file,
+            // but not guaranteed durable. Only sync_all/fsync makes a persistence guarantee.
             f.sync_all().await?;
 
             // acquire write lock of mem
@@ -280,6 +282,13 @@ where
     /// No WAL entry for missing keys.
     /// Durability before visibility.
     async fn delete_with_flush(&self, key: K) -> Result<Option<V>, KVLogError> {
+        {
+            let mem_lock = self.mem.read().await;
+            if mem_lock.get(&key).is_none() {
+                return Ok(None);
+            }
+        }
+
         let entry: WALEntry<K, V> = WALEntry::Delete { key: key.clone() };
 
         // encode the log entry into raw bytes
@@ -295,10 +304,11 @@ where
         to_write.extend(encoded);
 
         {
+            // always keep the lock order the same to avoid deadlock
             let mut f = self.log.write().await;
-
             // check if the key exists
             let mut mem_lock = self.mem.write().await;
+
             if mem_lock.get(&key).is_none() {
                 // key not exist, return without entry log, but this is not an error
                 return Ok(None);
@@ -318,6 +328,13 @@ where
     /// OS buffer will automatically flush but could be at any time, it is not deterministic
     /// call flush() to batch flush all prior writes in the os buffer to disk.
     async fn delete_without_flush(&self, key: K) -> Result<Option<V>, KVLogError> {
+        {
+            let mem_lock = self.mem.read().await;
+            if mem_lock.get(&key).is_none() {
+                return Ok(None);
+            }
+        }
+
         let entry: WALEntry<_, V> = WALEntry::Delete { key: key.clone() };
 
         let encoded = bincode::encode_to_vec(entry, bincode::config::standard())?;
@@ -365,7 +382,7 @@ where
 // - extra bonus: thoughts on the interface (e.g. trait_variant, non-mut get and delete, return value on set, etc.)
 #[cfg(test)]
 mod tests {
-    use crate::{wal::crc32, KVLog, KVStore};
+    use crate::{KVLog, KVStore, wal::crc32};
     use std::collections::HashSet;
     use std::path::PathBuf;
     use std::sync::Arc;

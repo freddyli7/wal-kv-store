@@ -1,6 +1,8 @@
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+// Error: implements the std::error::Error trait, so the type behaves like a standard error.
+// Debug: lets you format the value with {:?} for debugging output. used for println!("{:?}") or dbg!()
 pub enum KVLogError {
     #[error("io error: {0}")] // Display format
     Io(#[from] std::io::Error), // any I/O error becomes KvError::Io.

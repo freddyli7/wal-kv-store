@@ -7,6 +7,7 @@ pub(crate) const MAX_ENTRY_SIZE: usize = 1024 * 1024; // 1 MiB, adjust as needed
 pub(crate) const ENTRY_PREFIX_LEN: usize = 4;
 pub(crate) const CHECKSUM_LEN: usize = 4;
 
+// Rust attribute that auto‑implements traits for a type
 #[derive(Serialize, Deserialize, Decode, Encode)]
 pub(crate) enum WALEntry<K, V> {
     Set { key: K, value: V },
