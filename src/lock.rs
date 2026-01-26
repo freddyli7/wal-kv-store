@@ -14,6 +14,7 @@ pub(crate) fn acquire_file_lock(p: &str) -> Result<std::fs::File, KVLogError> {
         .read(true)
         .write(true)
         .open(lock_path)?;
+    // if another process is trying to acquire this lock while it is already held by one process, it will return an IO error
     file.try_lock_exclusive()?;
 
     Ok(file)

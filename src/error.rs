@@ -18,4 +18,6 @@ pub enum KVLogError {
     InvalidPrefix { msg: String },
     #[error("key not found: {msg}")]
     KeyNotFound { msg: String },
+    #[error("invalid file path format: {msg}")]
+    InvalidFilePathFormat { msg: String },
 }

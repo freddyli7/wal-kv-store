@@ -1,8 +1,8 @@
 // Given the following trait representing a key-value store
 
 use crate::KVLogError;
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::Serialize;
 
 // async fn traits aren’t object‑safe by default
 #[trait_variant::make(KVStore: Send)]
@@ -19,4 +19,5 @@ where
     async fn delete_with_flush(&self, key: K) -> Result<Option<V>, KVLogError>;
     async fn delete_without_flush(&self, key: K) -> Result<Option<V>, KVLogError>;
     async fn flush(&self) -> Result<(), KVLogError>;
+    async fn on_snapshot(&self) -> Result<bool, KVLogError>;
 }

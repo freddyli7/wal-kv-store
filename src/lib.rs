@@ -7,6 +7,7 @@
 mod error;
 mod kvlog;
 mod lock;
+mod manifest;
 mod traits;
 mod wal;
 

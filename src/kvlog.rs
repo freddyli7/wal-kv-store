@@ -1,16 +1,20 @@
 use crate::KVLogError;
 use crate::KVStore;
 use crate::lock::acquire_file_lock;
+use crate::manifest::Manifest;
 use crate::wal::{
-    CHECKSUM_LEN, ENTRY_PREFIX_LEN, MAX_ENTRY_SIZE, WALEntry, crc32, parse_prefix_bytes,
+    CHECKSUM_LEN, ENTRY_PREFIX_LEN, MAX_ENTRY_SIZE, WALEntry, crc32, next_file_path,
+    parse_prefix_bytes, wal_checksum,
 };
+use bincode::Encode;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::io::SeekFrom;
+use std::io::{SeekFrom, Write};
+use std::path::Path;
 use std::sync::Arc;
-use tokio::fs::{File, OpenOptions};
+use tokio::fs::{File, OpenOptions, rename};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 
@@ -20,7 +24,16 @@ pub struct KVLog<K, V> {
     // Read lock held → any number of reads, no write and writers must wait until all readers release their lock;
     // No lock → any number of reads or a single writer
     mem: Arc<RwLock<HashMap<K, V>>>,
+
     log: Arc<RwLock<File>>, // Arc makes it shareable across threads / async tasks.
+    log_path: Arc<RwLock<String>>,
+
+    snapshot: Arc<RwLock<File>>,
+    snapshot_path: Arc<RwLock<String>>,
+
+    manifest: Arc<RwLock<File>>,
+    manifest_path: Arc<RwLock<String>>,
+
     // _file_lock will keep the file lock held until KVLog is dropped.
     _file_lock: std::fs::File,
 }
@@ -48,21 +61,43 @@ where
     /// so WAL will be stored like: [01,02,03,04,aa,bb,cc,dd,5f,12,42,43,56,22,44,00,00,00,1a,ff,aa,33,aa,1c,3a,4b,11,25,54,65] which represent two entries:
     /// SET(1,2)
     /// DELETE(1)
-    pub async fn load(path: &str) -> Result<Self, KVLogError> {
+    pub async fn load(
+        log_file_path: &str,
+        snapshot_file_path: &str,
+        snapshot_marker_file_path: &str,
+    ) -> Result<Self, KVLogError> {
         // acquires the file lock, so no other task(process) can access the file until this lock is released.
-        // store the lock handle inside KVLog so that lock stays held for the lifetime of the struct.
-        let _file_lock = acquire_file_lock(path)?;
+        // store the lock handle inside KVLog so that lock stays held for the lifetime of the struct, including load(), and all other setter and getter.
+        let _file_lock = acquire_file_lock(log_file_path)?;
 
         // open WAL or create one if missing
         let file = OpenOptions::new()
             .read(true)
             .append(true)
             .create(true)
-            .open(path)
+            .open(log_file_path)
+            .await?;
+
+        // open snapshot file create if missing
+        let snapshot_file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .open(snapshot_file_path)
+            .await?;
+
+        // open snapshot_marker file create if missing
+        let snapshot_marker_file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .open(snapshot_marker_file_path)
             .await?;
 
         let log = Arc::new(RwLock::new(file));
         let mem = Arc::new(RwLock::new(HashMap::new()));
+        let snapshot_file = Arc::new(RwLock::new(snapshot_file));
+        let snapshot_marker_file = Arc::new(RwLock::new(snapshot_marker_file));
 
         // recover
         {
@@ -159,6 +194,9 @@ where
         Ok(KVLog {
             mem,
             log,
+            log_file_path: Arc::new(RwLock::new(log_file_path.to_string())),
+            snapshot_file,
+            snapshot_marker_file,
             _file_lock,
         })
     }
@@ -370,6 +408,134 @@ where
 
         Ok(())
     }
+
+    /// On snapshot:
+    /// The goal is to make the snapshotting process concurrency safe and crash safe.
+    /// Hold all locks, pause the world when snapshotting -- this will slow the latency but guarantee the consistency of snapshot.
+    /// There will be one snapshot file for each wal log snapshotting process, but only one manifest file.
+    /// No wal log or snapshot file will be deleted during the snapshotting process.
+    /// Using temp → write → fsync file → rename → fsync dir for snapshots and manifest.
+    /// Updating in-mem handles at the end.
+    ///
+    /// The manifest rename is the commit point:
+    /// Crash before it → restart uses old manifest → old snapshot is still present → recovery is consistent.
+    /// Crash after it → restart uses new manifest → new snapshot is present → recovery is consistent.
+    ///     If a crash happens after manifest rename but before new WAL is created, restart can safely create the next WAL file (since the manifest says the snapshot already covers
+    ///     the old WAL).
+    async fn on_snapshot(&self) -> Result<bool, KVLogError> {
+        // write_lock_log prevents other threads from writing to the log file
+        let mut write_lock_log = self.log.write().await;
+        // write_lock_log_path prevents other threads from writing or reading the log file path
+        let mut write_lock_log_path = self.log_path.write().await;
+
+        // read_lock_mem prevents other threads from writing to the mem map but allow reading from
+        let read_lock_mem = self.mem.read().await;
+
+        // write_lock_snapshot prevents other threads from writing or reading the snapshot file
+        let mut write_lock_snapshot = self.snapshot.write().await;
+        // write_lock_snapshot_path prevents other threads from writing or reading the snapshot file path
+        let mut write_lock_snapshot_path = self.snapshot_path.write().await;
+
+        // write_lock_manifest prevents other threads from writing or reading the manifest file
+        let mut write_lock_manifest = self.manifest.write().await;
+        // write_lock_manifest_path prevents other threads from writing or reading the manifest file path
+        let write_lock_manifest_path = self.manifest_path.write().await;
+
+        // create snapshot of mem
+        let snapshot = bincode::encode_to_vec(read_lock_mem.clone(), bincode::config::standard())?;
+
+        // new a tmp snapshot
+        let new_snapshot_path = next_file_path(&write_lock_snapshot_path)?;
+        let temp_new_snapshot_path = format!("{}.{}", new_snapshot_path, "tmp");
+        let mut temp_new_snapshot = OpenOptions::new()
+            .write(true)
+            // make sure nothing in the tmp file, there might be old snapshot.tmp
+            .truncate(true)
+            .create(true)
+            .open(&temp_new_snapshot_path)
+            .await?;
+
+        // snapshot of mem in snapshot.tmp
+        temp_new_snapshot.write_all(&snapshot).await?;
+        temp_new_snapshot.sync_all().await?;
+
+        // atomic rename snapshot_xxx.tmp to snapshot_xxx
+        rename(&temp_new_snapshot_path, &new_snapshot_path).await?;
+        // after renaming, open its parent dir and fsync to make sure the renaming is durable
+        let parent_dir =
+            Path::new(&new_snapshot_path)
+                .parent()
+                .ok_or(KVLogError::InvalidFilePathFormat {
+                    msg: "can not find parent dir of snapshot".to_string(),
+                })?;
+        // for dir fsync, put read-only access
+        let dir = OpenOptions::new().read(true).open(parent_dir).await?;
+        dir.sync_all().await?;
+
+        // new a tmp manifest to indicate the snapshot
+        let temp_manifest_path = format!("{}.{}", &write_lock_manifest_path, "tmp");
+        let manifest_path = &*write_lock_manifest_path;
+        let mut temp_manifest = OpenOptions::new()
+            .write(true)
+            // make sure nothing in the tmp file, there might be old manifest.tmp, same effect as temp_manifest_file.set_len(0).await?;
+            .truncate(true)
+            .create(true)
+            .open(&temp_manifest_path)
+            .await?;
+
+        // write & fsync manifest
+        let wal_checksum = wal_checksum(&mut *write_lock_log).await?;
+        let manifest = Manifest::new(
+            new_snapshot_path.clone(),
+            write_lock_log_path.clone(),
+            wal_checksum,
+        );
+        let manifest_bytes = bincode::encode_to_vec(&manifest, bincode::config::standard())?;
+        temp_manifest.write_all(&manifest_bytes).await?;
+        temp_manifest.sync_all().await?;
+
+        // rename manifest.tmp to manifest
+        rename(temp_manifest_path, manifest_path).await?;
+        let parent_dir =
+            Path::new(manifest_path)
+                .parent()
+                .ok_or(KVLogError::InvalidFilePathFormat {
+                    msg: "can not find parent dir of manifest".to_string(),
+                })?;
+        // for dir fsync, put read-only access
+        let dir = OpenOptions::new().read(true).open(parent_dir).await?;
+        dir.sync_all().await?;
+
+        // updating all in-mem handles
+
+        // update the snapshot file handle to point to the new snapshot file with correct access options
+        *write_lock_snapshot = OpenOptions::new()
+            .read(true)
+            .open(&new_snapshot_path)
+            .await?;
+        // update the snapshot file path var to point to the new snapshot file path
+        *write_lock_snapshot_path = new_snapshot_path;
+
+        // update the manifest file handle to point to the same manifest file with correct access options
+        *write_lock_manifest = OpenOptions::new().read(true).open(manifest_path).await?;
+
+        // create new wal log with new path(name)
+        let new_log_file_path = next_file_path(&write_lock_log_path)?;
+        let new_log_file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .open(new_log_file_path.clone())
+            .await?;
+
+        // update the log file handle to point to the new log file
+        *write_lock_log = new_log_file;
+
+        // update the log file path var to point to the new log file path
+        *write_lock_log_path = new_log_file_path;
+
+        Ok(true)
+    }
 }
 
 // please include the following:
@@ -410,7 +576,7 @@ mod tests {
     }
 
     async fn setup(path: &str) -> KVLog<String, String> {
-        KVLog::<String, String>::load(path)
+        KVLog::<String, String>::load(path, "", "")
             .await
             .expect("load failed")
     }
@@ -753,9 +919,6 @@ mod tests {
     //       - Strict ordering guarantees. Write is strictly ordered, read is not. Done
     //       - Tests for concurrent writers/readers/deletes across threads.
     //       - Defined behavior for read‑your‑write and visibility. Done
-    //   - Resource management
-    //       - WAL compaction / snapshotting to cap log growth.
-    //       - Backpressure or size limits to avoid disk exhaustion.
     //   - Operational safety
     //       - File locking to prevent multi‑process writers. Impl done, need multi-processes tests
     //       - Define KVLogError type Done
@@ -766,4 +929,23 @@ mod tests {
     //   - Documentation
     //       - Explicit guarantees (durability, consistency, concurrency).
     //       - Known limitations (e.g., single‑process only).
+    //   - Resource management
+    //       - WAL compaction / snapshotting to cap log growth.
+    //       - Backpressure or size limits to avoid disk exhaustion.
+
+    // set a config value for the threshold of each wal log file -- log file size
+    // logic to determine if the log file should be splited by size
+
+    // on snapshot:
+    // hold write lock on current wal log file so that no write nor read allowed on log, hold read lock on mem so only more read allowed from mem
+    // take snapshot on mem, write&fsync to snapshot.log file
+    // create a marker/manifest file to indicate the snapshot file name
+    // create a new wal log file with new name and repoint the current file var to this new file
+    // release read lock
+
+    // on restart:
+    // no write or read allowed until load() returns
+    // load the marker file first and see which wal the snapshot covers,
+    // load snapshot file into mem
+    // then load the latest wal log file
 }
