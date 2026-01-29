@@ -6,10 +6,12 @@ use std::fs::OpenOptions as std_OpenOptions;
 // canonicalize to an absolute real path
 pub(crate) fn normalized_path(p: &str) -> Result<String, KVLogError> {
     let path = std::path::Path::new(p);
-    let canon = path.canonicalize()?;
-    let conon_str = canon.to_string_lossy().to_string();
-
-    Ok(conon_str)
+    // if p is just a filename, treat it like a current directory
+    let parent = path.parent().unwrap_or(std::path::Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let canon_parent = parent.canonicalize()?;
+    let file = path.file_name().ok_or(KVLogError::InvalidFilePathFormat { msg: "bad path".into() })?;
+    Ok(canon_parent.join(file).to_string_lossy().to_string())
 }
 
 // acquire_file_lock acquires a file lock on the given path
