@@ -9,7 +9,7 @@ mod kvlog;
 mod lock;
 mod manifest;
 mod traits;
-mod wal;
+mod utils;
 
 pub use error::KVLogError;
 pub use kvlog::KVLog;

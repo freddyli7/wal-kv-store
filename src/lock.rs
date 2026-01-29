@@ -10,6 +10,8 @@ pub(crate) fn acquire_file_lock(p: &str) -> Result<std::fs::File, KVLogError> {
     // a std::fs::OpenOptions is enough, no need for tokio::fs::OpenOptions
     let lock_path = path.with_extension("lock");
     let file = std_OpenOptions::new()
+        // this will only create a file if the parent directory exists
+        // non‑existent directory will fail to create the file
         .create(true)
         .read(true)
         .write(true)

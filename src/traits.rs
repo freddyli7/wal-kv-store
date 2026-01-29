@@ -1,8 +1,8 @@
 // Given the following trait representing a key-value store
 
 use crate::KVLogError;
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 // async fn traits aren’t object‑safe by default
 #[trait_variant::make(KVStore: Send)]

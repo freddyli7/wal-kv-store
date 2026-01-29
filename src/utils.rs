@@ -2,14 +2,19 @@ use crate::KVLogError;
 use bincode::{Decode, Encode};
 use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
+use std::io::ErrorKind;
 use std::path::Path;
-use std::time::SystemTime;
+use std::sync::Arc;
+use tokio::fs::OpenOptions;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
+use tokio::sync::RwLock;
 
 pub(crate) const MAX_ENTRY_SIZE: usize = 1024 * 1024; // 1 MiB, adjust as needed
 pub(crate) const ENTRY_PREFIX_LEN: usize = 4;
 pub(crate) const CHECKSUM_LEN: usize = 4;
 pub(crate) const WAL_FILE_MAX_SIZE: usize = 1024 * 1024; // 1 MiB, adjust as needed
+pub(crate) const DEFAULT_WAL_PATH: &str = "wal_0";
+pub(crate) const DEFAULT_SNAPSHOT_PATH: &str = "snapshot_0";
 
 // Rust attribute that auto‑implements traits for a type
 #[derive(Serialize, Deserialize, Decode, Encode)]
@@ -42,13 +47,10 @@ pub(crate) fn is_wal_log_full(path: &Path) -> Result<bool, KVLogError> {
 
 // next_file_path returns the next file path to write to based on the current file path.
 pub(crate) fn next_file_path(current: &str) -> Result<String, KVLogError> {
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    if let Some((static_path, _)) = current.rsplit_once('_') {
-        // split the last _
-        let new_path = format!("{}_{}", static_path, nanos);
+    // split the last _
+    if let Some((static_path, num_str)) = current.rsplit_once('_') {
+        let number = num_str.parse::<u64>()?;
+        let new_path = format!("{}_{}", static_path, number + 1);
         return Ok(new_path);
     }
     Err(KVLogError::InvalidFilePathFormat {
@@ -75,4 +77,29 @@ pub(crate) async fn wal_checksum(f: &mut tokio::fs::File) -> Result<u32, KVLogEr
     // restore position (append writes will still go to end, but keep it tidy)
     f.seek(SeekFrom::Start(cur)).await?;
     Ok(hasher.finalize())
+}
+
+pub(crate) async fn load_file_as_bytes_in_full(path: &str) -> Result<Option<Vec<u8>>, KVLogError> {
+    let file_handle = match OpenOptions::new().read(true).open(path).await {
+        Ok(file) => Some(file),
+        Err(e) if e.kind() == ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(KVLogError::LoadingError {
+                msg: format!("failed to load file from path: {}, error: {}", path, e),
+            });
+        }
+    };
+
+    if let Some(file) = file_handle {
+        let a_f = Arc::new(RwLock::new(file));
+        let mut write_lock = a_f.write().await;
+        write_lock.seek(SeekFrom::Start(0)).await?;
+
+        let mut buf = Vec::new();
+        write_lock.read_to_end(&mut buf).await?;
+
+        Ok(Some(buf))
+    } else {
+        Ok(None)
+    }
 }

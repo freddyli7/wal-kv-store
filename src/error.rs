@@ -12,12 +12,18 @@ pub enum KVLogError {
     Encode(#[from] bincode::error::EncodeError),
     #[error("int conversion error: {0}")]
     Int(#[from] std::num::TryFromIntError),
+    #[error("int conversion error: {0}")]
+    ParseIntError(#[from] std::num::ParseIntError),
     #[error("corrupt wal: {0}")]
     CorruptWal(String), // a custom error with your own message.
+    #[error("corrupt snapshot: {0}")]
+    CorruptSnapshot(String),
     #[error("invalid prefix: {msg}")]
     InvalidPrefix { msg: String },
     #[error("key not found: {msg}")]
     KeyNotFound { msg: String },
     #[error("invalid file path format: {msg}")]
     InvalidFilePathFormat { msg: String },
+    #[error("Loading error: {msg}")]
+    LoadingError { msg: String },
 }
