@@ -1,20 +1,20 @@
-use crate::lock::acquire_file_lock;
-use crate::manifest::Manifest;
-use crate::utils::{
-    crc32, load_file_as_bytes_in_full, next_file_path, parse_prefix_bytes, wal_checksum,
-    WALEntry, CHECKSUM_LEN, DEFAULT_SNAPSHOT_PATH, DEFAULT_WAL_PATH, ENTRY_PREFIX_LEN, MAX_ENTRY_SIZE,
-};
 use crate::KVLogError;
 use crate::KVStore;
+use crate::lock::{acquire_file_lock, normalized_path};
+use crate::manifest::Manifest;
+use crate::utils::{
+    CHECKSUM_LEN, DEFAULT_SNAPSHOT_PATH, DEFAULT_WAL_PATH, ENTRY_PREFIX_LEN, MAX_ENTRY_SIZE,
+    WALEntry, crc32, load_file_as_bytes_in_full, next_file_path, parse_prefix_bytes, wal_checksum,
+};
 use bincode::Encode;
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::io::{SeekFrom, Write};
 use std::path::Path;
 use std::sync::Arc;
-use tokio::fs::{rename, File, OpenOptions};
+use tokio::fs::{File, OpenOptions, rename};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 
@@ -66,7 +66,7 @@ where
     pub async fn load(manifest_path: &str) -> Result<Self, KVLogError> {
         // acquires the file lock on the manifest path, so no other task(process) can access any files in this system until this lock is released.
         // store the lock handle inside KVLog so that the lock stays held for the lifetime of the struct, including load(), on_snapshot(), and all other setter and getter methods
-        let _anti_multiprocess_lock = acquire_file_lock(&manifest_path)?;
+        let _anti_multiprocess_lock = acquire_file_lock(&normalized_path(&manifest_path)?)?;
 
         let (snapshot, snapshot_path, wal_log_path) = if let Some(file_buf) =
             load_file_as_bytes_in_full(manifest_path).await?
@@ -561,7 +561,7 @@ where
 // - extra bonus: thoughts on the interface (e.g. trait_variant, non-mut get and delete, return value on set, etc.)
 #[cfg(test)]
 mod tests {
-    use crate::{utils::crc32, KVLog, KVStore};
+    use crate::{KVLog, KVStore, utils::crc32};
     use std::collections::HashSet;
     use std::path::PathBuf;
     use std::sync::Arc;

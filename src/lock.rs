@@ -2,6 +2,17 @@ use crate::KVLogError;
 use fs2::FileExt;
 use std::fs::OpenOptions as std_OpenOptions;
 
+// normalized_path normalized the given path
+// canonicalize to an absolute real path
+pub(crate) fn normalized_path(p: &str) -> Result<String, KVLogError> {
+    let path = std::path::Path::new(p);
+    let canon = path.canonicalize()?;
+    let conon_str = canon.to_string_lossy().to_string();
+
+    Ok(conon_str)
+}
+
+// acquire_file_lock acquires a file lock on the given path
 pub(crate) fn acquire_file_lock(p: &str) -> Result<std::fs::File, KVLogError> {
     let path = std::path::Path::new(p);
 
