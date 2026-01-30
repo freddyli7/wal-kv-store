@@ -1,20 +1,20 @@
-use crate::KVLogError;
-use crate::KVStore;
-use crate::lock::{acquire_file_lock, normalized_path};
+use crate::lock::acquire_file_lock;
 use crate::manifest::Manifest;
 use crate::utils::{
-    CHECKSUM_LEN, DEFAULT_SNAPSHOT_PATH, DEFAULT_WAL_PATH, ENTRY_PREFIX_LEN, MAX_ENTRY_SIZE,
-    WALEntry, crc32, load_file_as_bytes_in_full, next_file_path, parse_prefix_bytes, wal_checksum,
+    crc32, get_parent_dir, load_file_as_bytes_in_full, next_file_path, normalized_path,
+    parse_prefix_bytes, wal_checksum, WALEntry, CHECKSUM_LEN, DEFAULT_SNAPSHOT_PATH, DEFAULT_WAL_PATH,
+    ENTRY_PREFIX_LEN, MAX_ENTRY_SIZE,
 };
-use bincode::Encode;
-use serde::Serialize;
+use crate::KVLogError;
+use crate::KVStore;
 use serde::de::DeserializeOwned;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::io::{SeekFrom, Write};
+use std::io::{SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
-use tokio::fs::{File, OpenOptions, rename};
+use tokio::fs::{rename, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 
@@ -34,9 +34,10 @@ pub struct KVLog<K, V> {
 
     manifest_path: Arc<RwLock<String>>,
 
-    // _file_lock will keep the file lock on a specific lock file held until KVLog is dropped.
+    // _anti_multiprocess_lock will keep the file lock on a specific lock file held until KVLog is dropped.
     // this lock file will never be changed or used
     // it is specifically used to multi-process locking
+    // constraint: one DB per directory path; symlinked/bind‑mounted aliases are unsupported.
     _anti_multiprocess_lock: std::fs::File,
 }
 
@@ -64,31 +65,59 @@ where
     /// SET(1,2)
     /// DELETE(1)
     pub async fn load(manifest_path: &str) -> Result<Self, KVLogError> {
+        // ensure the given path is normalized and parent dir exists
+        let manifest_path_norm = normalized_path(&manifest_path)?;
+
         // acquires the file lock on the manifest path, so no other task(process) can access any files in this system until this lock is released.
         // store the lock handle inside KVLog so that the lock stays held for the lifetime of the struct, including load(), on_snapshot(), and all other setter and getter methods
-        let _anti_multiprocess_lock = acquire_file_lock(&normalized_path(&manifest_path)?)?;
+        // Here we have two options:
+        // 1. lock on a separated file: for cross‑platform safety like Windows, keep renaming -- Our current approach
+        // 2. lock on manifest itself: atomic manifest replace may break on Windows.
+        // on_snapshot() does rename(temp_manifest, manifest_path) while the
+        // manifest file is opened and locked in _anti_multiprocess_lock.
+        // On Windows, renaming over an open file commonly fails
+        let _anti_multiprocess_lock = acquire_file_lock(&manifest_path_norm)?;
 
-        let (snapshot, snapshot_path, wal_log_path) = if let Some(file_buf) =
-            load_file_as_bytes_in_full(manifest_path).await?
-        {
-            let (manifest_content, _): (Manifest, usize) =
-                bincode::decode_from_slice(&file_buf, bincode::config::standard())?;
-            let snapshot_path = manifest_content.get_snapshot_path();
-            if let Some(file_buf) = load_file_as_bytes_in_full(snapshot_path).await? {
-                let (snapshot_content, _): (HashMap<K, V>, usize) =
-                    bincode::decode_from_slice(&file_buf, bincode::config::standard())?;
-                let target_wal_path = next_file_path(manifest_content.get_covered_wal_log_path())?;
-                (snapshot_content, snapshot_path.to_string(), target_wal_path)
+        let pwd = get_parent_dir(&manifest_path_norm)?;
+
+        let (snapshot, snapshot_path, wal_log_path) =
+            if let Some(file_buf) = load_file_as_bytes_in_full(&manifest_path_norm).await? {
+                // for empty manifest
+                if file_buf.len() == 0 {
+                    let mut snapshot_path = pwd.clone();
+                    snapshot_path.push(DEFAULT_SNAPSHOT_PATH);
+                    let mut wal_path = pwd.clone();
+                    wal_path.push(DEFAULT_WAL_PATH);
+                    (
+                        HashMap::<K, V>::new(),
+                        snapshot_path.to_string_lossy().to_string(),
+                        wal_path.to_string_lossy().to_string(),
+                    )
+                } else {
+                    let (manifest_content, _): (Manifest, usize) =
+                        bincode::decode_from_slice(&file_buf, bincode::config::standard())?;
+                    let snapshot_path = manifest_content.get_snapshot_path();
+                    if let Some(file_buf) = load_file_as_bytes_in_full(snapshot_path).await? {
+                        let (snapshot_content, _): (HashMap<K, V>, usize) =
+                            bincode::decode_from_slice(&file_buf, bincode::config::standard())?;
+                        let target_wal_path =
+                            next_file_path(manifest_content.get_covered_wal_log_path())?;
+                        (snapshot_content, snapshot_path.to_string(), target_wal_path)
+                    } else {
+                        return Err(KVLogError::CorruptSnapshot("no snapshot found".to_string()));
+                    }
+                }
             } else {
-                return Err(KVLogError::CorruptSnapshot("no snapshot found".to_string()));
-            }
-        } else {
-            (
-                HashMap::<K, V>::new(),
-                DEFAULT_SNAPSHOT_PATH.to_string(),
-                DEFAULT_WAL_PATH.to_string(),
-            )
-        };
+                let mut snapshot_path = pwd.clone();
+                snapshot_path.push(DEFAULT_SNAPSHOT_PATH);
+                let mut wal_path = pwd.clone();
+                wal_path.push(DEFAULT_WAL_PATH);
+                (
+                    HashMap::<K, V>::new(),
+                    snapshot_path.to_string_lossy().to_string(),
+                    wal_path.to_string_lossy().to_string(),
+                )
+            };
 
         // open WAL or create one if missing
         let file = OpenOptions::new()
@@ -98,12 +127,7 @@ where
             .open(&wal_log_path)
             .await?;
         // we need to fsync the dir to durable the wal log file if it is created
-        let parent_dir =
-            Path::new(&wal_log_path)
-                .parent()
-                .ok_or(KVLogError::InvalidFilePathFormat {
-                    msg: "can not find parent dir of file".to_string(),
-                })?;
+        let parent_dir = get_parent_dir(&wal_log_path)?;
         // for dir fsync, put read-only access
         let dir = OpenOptions::new().read(true).open(parent_dir).await?;
         dir.sync_all().await?;
@@ -208,7 +232,7 @@ where
             log,
             log_path: Arc::new(RwLock::new(wal_log_path)),
             snapshot_path: Arc::new(RwLock::new(snapshot_path.to_string())),
-            manifest_path: Arc::new(RwLock::new(manifest_path.to_string())),
+            manifest_path: Arc::new(RwLock::new(manifest_path_norm.to_string())),
             _anti_multiprocess_lock,
         })
     }
@@ -561,7 +585,7 @@ where
 // - extra bonus: thoughts on the interface (e.g. trait_variant, non-mut get and delete, return value on set, etc.)
 #[cfg(test)]
 mod tests {
-    use crate::{KVLog, KVStore, utils::crc32};
+    use crate::{utils::crc32, KVLog, KVStore};
     use std::collections::HashSet;
     use std::path::PathBuf;
     use std::sync::Arc;

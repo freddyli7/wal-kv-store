@@ -3,12 +3,13 @@ use bincode::{Decode, Encode};
 use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
 use std::io::ErrorKind;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 use tokio::sync::RwLock;
 
+pub(crate) const ANTI_MULTI_PROCESS_LOCK_FILE_NAME: &str = "kvlog.lock";
 pub(crate) const MAX_ENTRY_SIZE: usize = 1024 * 1024; // 1 MiB, adjust as needed
 pub(crate) const ENTRY_PREFIX_LEN: usize = 4;
 pub(crate) const CHECKSUM_LEN: usize = 4;
@@ -102,4 +103,29 @@ pub(crate) async fn load_file_as_bytes_in_full(path: &str) -> Result<Option<Vec<
     } else {
         Ok(None)
     }
+}
+
+pub(crate) fn get_parent_dir(path: &str) -> Result<PathBuf, KVLogError> {
+    Path::new(path)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .ok_or(KVLogError::InvalidFilePathFormat {
+            msg: "can not find parent dir of file".to_string(),
+        })
+}
+
+// normalized_path normalized the given path
+// canonicalized to an absolute real path
+// It normalizes a file path into a canonical absolute path, while ensuring the parent directory exists.
+// So "./data/manifest" becomes something like "/abs/path/data/manifest", and the parent dir is created if needed.
+pub(crate) fn normalized_path(p: &str) -> Result<String, KVLogError> {
+    let path = Path::new(p);
+    // if p is just a filename, treat it like a current directory
+    let parent = path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let canon_parent = parent.canonicalize()?;
+    let file = path.file_name().ok_or(KVLogError::InvalidFilePathFormat {
+        msg: "bad path".into(),
+    })?;
+    Ok(canon_parent.join(file).to_string_lossy().to_string())
 }
