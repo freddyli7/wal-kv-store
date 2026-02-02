@@ -1,9 +1,9 @@
 use crate::lock::acquire_file_lock;
 use crate::manifest::Manifest;
 use crate::utils::{
-    crc32, get_parent_dir, load_file_as_bytes_in_full, next_file_path, normalized_path,
-    parse_prefix_bytes, wal_checksum, WALEntry, CHECKSUM_LEN, DEFAULT_SNAPSHOT_PATH, DEFAULT_WAL_PATH,
-    ENTRY_PREFIX_LEN, MAX_ENTRY_SIZE,
+    crc32, get_parent_dir, is_wal_log_full, load_file_as_bytes_in_full, next_file_path,
+    normalized_path, parse_prefix_bytes, wal_checksum, WALEntry, CHECKSUM_LEN, DEFAULT_SNAPSHOT_PATH,
+    DEFAULT_WAL_PATH, ENTRY_PREFIX_LEN, MAX_ENTRY_SIZE,
 };
 use crate::KVLogError;
 use crate::KVStore;
@@ -11,12 +11,14 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::io::{SeekFrom};
+use std::io::SeekFrom;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering::{AcqRel};
 use std::sync::Arc;
 use tokio::fs::{rename, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 
 /// lock order: log → log_path → mem → snapshot_path → manifest_path
 pub struct KVLog<K, V> {
@@ -39,12 +41,35 @@ pub struct KVLog<K, V> {
     // it is specifically used to multi-process locking
     // constraint: one DB per directory path; symlinked/bind‑mounted aliases are unsupported.
     _anti_multiprocess_lock: std::fs::File,
+
+    current_wal_size: usize,
+
+    snapshot_worker_signal_chan_tx: mpsc::Sender<()>,
+
+    // use AtomicBool for a single flag; use Arc<RwLock<...>> when the flag must change together with other shared state or you already have a lock for related state.
+    snapshot_in_process: AtomicBool,
 }
 
 impl<K, V> KVLog<K, V>
 where
-    K: Hash + Eq + bincode::Encode + bincode::Decode<()>,
-    V: bincode::Encode + bincode::Decode<()>,
+    K: Serialize
+        + DeserializeOwned
+        + Send
+        + Sync
+        + bincode::Encode
+        + bincode::Decode<()>
+        + Clone
+        + Eq
+        + Hash
+        + 'static,
+    V: Serialize
+        + DeserializeOwned
+        + Send
+        + Sync
+        + bincode::Encode
+        + bincode::Decode<()>
+        + Clone
+        + 'static,
 {
     /// load will initialize a KVLog from the given path or creating a new one if it does not exist.
     /// During loading, no reading or writing is allowed.
@@ -134,6 +159,7 @@ where
 
         let log = Arc::new(RwLock::new(file));
         let mem = Arc::new(RwLock::new(snapshot));
+        let mut current_wal_size = 0usize;
 
         // recover
         {
@@ -224,17 +250,29 @@ where
             }
             // Truncates or extends the underlying file, updating the size of this file to become size.
             f.set_len(offset as u64).await?;
+            current_wal_size = offset;
         }
 
-        // only the recovering id completed and KVLog is returned from here, other thread can acquire the mem lock
-        Ok(KVLog {
+        let (tx, rx) = mpsc::channel(1);
+        let log = KVLog {
             mem,
             log,
             log_path: Arc::new(RwLock::new(wal_log_path)),
             snapshot_path: Arc::new(RwLock::new(snapshot_path.to_string())),
             manifest_path: Arc::new(RwLock::new(manifest_path_norm.to_string())),
             _anti_multiprocess_lock,
-        })
+            current_wal_size,
+            snapshot_worker_signal_chan_tx: tx,
+            snapshot_in_process: AtomicBool::new(false),
+        };
+
+        let snapshot_worker = Arc::new(&log);
+        tokio::spawn(async move {
+            //  TODO: take the signal from rx and do snapshot
+        });
+
+        // only the recovering is completed and KVLog is returned from here, other thread can acquire the mem lock
+        Ok(log)
     }
 }
 
@@ -293,7 +331,7 @@ where
         //  1. Writer A writes to WAL, releases log lock.
         //  2. Writer B writes to WAL, releases log lock.
         //  3. A then updates mem, then B updates mem — order depends on who gets mem lock first, not WAL order.
-        {
+        let result = {
             let mut f = self.log.write().await;
             f.write_all(&to_write).await?;
             // A crash or power loss during write_all or before sync_all can leave a partial entry
@@ -317,8 +355,19 @@ where
             // any readers trying to acquire mem.read() will block until the writer releases that lock.
             let mut mem = self.mem.write().await;
             // HashMap insert API: if key not exist, return None, otherwise return old value
-            Ok(mem.insert(key, value))
+            mem.insert(key, value)
+
+            // TODO: add up the wal size
+        };
+
+        // check if wal size reaches the cap
+        if is_wal_log_full(self.current_wal_size) && !self.snapshot_in_process.swap(true, AcqRel) {
+            //  send signal to snapshot worker to take snapshot
+            let _ = self.snapshot_worker_signal_chan_tx.try_send(());
+            // TODO: handle the error
         }
+
+        Ok(result)
     }
 
     /// set_without_flush only appends to WAL(in the OS buffer) and updates the mem, but does not fsync

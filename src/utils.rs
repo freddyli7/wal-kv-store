@@ -41,9 +41,11 @@ pub(crate) fn parse_prefix_bytes(d: &[u8]) -> Result<u32, KVLogError> {
     Ok(u32::from_le_bytes([d[0], d[1], d[2], d[3]]))
 }
 
-pub(crate) fn is_wal_log_full(path: &Path) -> Result<bool, KVLogError> {
-    // TODO
-    Ok(true)
+pub(crate) fn is_wal_log_full(current_size: usize) -> bool {
+    if current_size > WAL_FILE_MAX_SIZE {
+        return true;
+    }
+    false
 }
 
 // next_file_path returns the next file path to write to based on the current file path.
