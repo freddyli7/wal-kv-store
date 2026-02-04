@@ -19,5 +19,8 @@ where
     async fn delete_with_flush(&self, key: K) -> Result<Option<V>, KVLogError>;
     async fn delete_without_flush(&self, key: K) -> Result<Option<V>, KVLogError>;
     async fn flush(&self) -> Result<(), KVLogError>;
+}
+
+pub(crate) trait Snapshot {
     async fn on_snapshot(&self) -> Result<bool, KVLogError>;
 }

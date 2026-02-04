@@ -1,27 +1,34 @@
-use crate::lock::acquire_file_lock;
-use crate::manifest::Manifest;
-use crate::utils::{
-    crc32, get_parent_dir, is_wal_log_full, load_file_as_bytes_in_full, next_file_path,
-    normalized_path, parse_prefix_bytes, wal_checksum, WALEntry, CHECKSUM_LEN, DEFAULT_SNAPSHOT_PATH,
-    DEFAULT_WAL_PATH, ENTRY_PREFIX_LEN, MAX_ENTRY_SIZE,
-};
 use crate::KVLogError;
 use crate::KVStore;
-use serde::de::DeserializeOwned;
+use crate::lock::acquire_file_lock;
+use crate::manifest::Manifest;
+use crate::traits::Snapshot;
+use crate::utils::{
+    CHECKSUM_LEN, DEFAULT_SNAPSHOT_PATH, DEFAULT_WAL_PATH, ENTRY_PREFIX_LEN, MAX_ENTRY_SIZE,
+    WALEntry, crc32, get_parent_dir, is_wal_log_full, load_file_as_bytes_in_full, next_file_path,
+    normalized_path, parse_prefix_bytes, wal_checksum,
+};
+use bincode::Encode;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::io::SeekFrom;
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering::{AcqRel};
 use std::sync::Arc;
-use tokio::fs::{rename, File, OpenOptions};
+use std::sync::atomic::Ordering::{AcqRel, Release};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use tokio::fs::{File, OpenOptions, rename};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::mpsc::error::TrySendError::{Closed, Full};
+use tokio::sync::{RwLock, mpsc};
 
 /// lock order: log → log_path → mem → snapshot_path → manifest_path
-pub struct KVLog<K, V> {
+pub(crate) struct KVLog<K, V>
+where
+    K: Clone + Encode,
+    V: Clone + Encode,
+{
     // RwLock: one write lock or multiple read locks at a time
     // Writer lock held → no reads, no other writes;
     // Read lock held → any number of reads, no write and writers must wait until all readers release their lock;
@@ -42,7 +49,7 @@ pub struct KVLog<K, V> {
     // constraint: one DB per directory path; symlinked/bind‑mounted aliases are unsupported.
     _anti_multiprocess_lock: std::fs::File,
 
-    current_wal_size: usize,
+    current_wal_size: AtomicUsize,
 
     snapshot_worker_signal_chan_tx: mpsc::Sender<()>,
 
@@ -89,7 +96,7 @@ where
     /// so WAL will be stored like: [01,02,03,04,aa,bb,cc,dd,5f,12,42,43,56,22,44,00,00,00,1a,ff,aa,33,aa,1c,3a,4b,11,25,54,65] which represent two entries:
     /// SET(1,2)
     /// DELETE(1)
-    pub async fn load(manifest_path: &str) -> Result<Self, KVLogError> {
+    pub async fn load(manifest_path: &str) -> Result<(Self, mpsc::Receiver<()>), KVLogError> {
         // ensure the given path is normalized and parent dir exists
         let manifest_path_norm = normalized_path(&manifest_path)?;
 
@@ -159,7 +166,7 @@ where
 
         let log = Arc::new(RwLock::new(file));
         let mem = Arc::new(RwLock::new(snapshot));
-        let mut current_wal_size = 0usize;
+        let current_wal_size = AtomicUsize::new(0);
 
         // recover
         {
@@ -250,10 +257,10 @@ where
             }
             // Truncates or extends the underlying file, updating the size of this file to become size.
             f.set_len(offset as u64).await?;
-            current_wal_size = offset;
+            current_wal_size.fetch_add(offset, Ordering::AcqRel);
         }
 
-        let (tx, rx) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::channel(1);
         let log = KVLog {
             mem,
             log,
@@ -266,13 +273,22 @@ where
             snapshot_in_process: AtomicBool::new(false),
         };
 
-        let snapshot_worker = Arc::new(&log);
-        tokio::spawn(async move {
-            //  TODO: take the signal from rx and do snapshot
-        });
-
         // only the recovering is completed and KVLog is returned from here, other thread can acquire the mem lock
-        Ok(log)
+        Ok((log, rx))
+    }
+}
+
+impl<K, V> KVLog<K, V>
+where
+    K: Clone + Encode,
+    V: Clone + Encode,
+{
+    pub(crate) fn swap_snapshot_flag(&self, new_value: bool) -> bool {
+        self.snapshot_in_process.swap(new_value, AcqRel)
+    }
+
+    pub(crate) fn store_snapshot_flag(&self, new_value: bool) {
+        self.snapshot_in_process.store(new_value, Release)
     }
 }
 
@@ -355,16 +371,27 @@ where
             // any readers trying to acquire mem.read() will block until the writer releases that lock.
             let mut mem = self.mem.write().await;
             // HashMap insert API: if key not exist, return None, otherwise return old value
-            mem.insert(key, value)
+            let re = mem.insert(key, value);
 
-            // TODO: add up the wal size
+            self.current_wal_size
+                .fetch_add(to_write.len(), Ordering::AcqRel);
+
+            re
         };
 
-        // check if wal size reaches the cap
-        if is_wal_log_full(self.current_wal_size) && !self.snapshot_in_process.swap(true, AcqRel) {
-            //  send signal to snapshot worker to take snapshot
-            let _ = self.snapshot_worker_signal_chan_tx.try_send(());
-            // TODO: handle the error
+        // check if wal size reaches the cap and do snapshot in background
+        if is_wal_log_full(&self.current_wal_size) {
+            // send signal to snapshot worker to take snapshot
+            if let Err(err) = self.snapshot_worker_signal_chan_tx.try_send(()) {
+                match err {
+                    Full(_) => {
+                        // snapshot already queued; ignore
+                    }
+                    Closed(_) => {
+                        eprintln!("snapshot worker closed; snapshots disabled");
+                    }
+                }
+            }
         }
 
         Ok(result)
@@ -389,13 +416,35 @@ where
         to_write.extend(checksum_bytes);
         to_write.extend(encoded);
 
-        {
+        let result = {
             let mut f = self.log.write().await;
             f.write_all(&to_write).await?;
 
             let mut mem = self.mem.write().await;
-            Ok(mem.insert(key, value))
+            let re = mem.insert(key, value);
+
+            self.current_wal_size
+                .fetch_add(to_write.len(), Ordering::AcqRel);
+
+            re
+        };
+
+        // check if wal size reaches the cap and do snapshot in background
+        if is_wal_log_full(&self.current_wal_size) {
+            // send signal to snapshot worker to take snapshot
+            if let Err(err) = self.snapshot_worker_signal_chan_tx.try_send(()) {
+                match err {
+                    Full(_) => {
+                        // snapshot already queued; ignore
+                    }
+                    Closed(_) => {
+                        eprintln!("snapshot worker closed; snapshots disabled");
+                    }
+                }
+            }
         }
+
+        Ok(result)
     }
 
     /// delete_with_flush appends the operation to log and removes the key from the mem
@@ -426,7 +475,7 @@ where
         to_write.extend(checksum_bytes);
         to_write.extend(encoded);
 
-        {
+        let result = {
             // always keep the lock order the same to avoid deadlock
             let mut f = self.log.write().await;
             // check if the key exists
@@ -441,8 +490,28 @@ where
             f.sync_all().await?;
 
             let re = mem_lock.remove(&key);
-            Ok(re)
+
+            self.current_wal_size
+                .fetch_add(to_write.len(), Ordering::AcqRel);
+            re
+        };
+
+        // check if wal size reaches the cap and do snapshot in background
+        if is_wal_log_full(&self.current_wal_size) {
+            // send signal to snapshot worker to take snapshot
+            if let Err(err) = self.snapshot_worker_signal_chan_tx.try_send(()) {
+                match err {
+                    Full(_) => {
+                        // snapshot already queued; ignore
+                    }
+                    Closed(_) => {
+                        eprintln!("snapshot worker closed; snapshots disabled");
+                    }
+                }
+            }
         }
+
+        Ok(result)
     }
 
     /// delete_without_flush only appends to WAL(in the OS buffer) and updates the mem, but does not fsync
@@ -471,7 +540,7 @@ where
         to_write.extend(checksum_bytes);
         to_write.extend(encoded);
 
-        {
+        let result = {
             let mut f = self.log.write().await;
 
             let mut mem_lock = self.mem.write().await;
@@ -482,8 +551,29 @@ where
             f.write_all(&to_write).await?;
 
             let re = mem_lock.remove(&key);
-            Ok(re)
+
+            self.current_wal_size
+                .fetch_add(to_write.len(), Ordering::AcqRel);
+
+            re
+        };
+
+        // check if wal size reaches the cap and do snapshot in background
+        if is_wal_log_full(&self.current_wal_size) {
+            // send signal to snapshot worker to take snapshot
+            if let Err(err) = self.snapshot_worker_signal_chan_tx.try_send(()) {
+                match err {
+                    Full(_) => {
+                        // snapshot already queued; ignore
+                    }
+                    Closed(_) => {
+                        eprintln!("snapshot worker closed; snapshots disabled");
+                    }
+                }
+            }
         }
+
+        Ok(result)
     }
 
     // flush does manual fsync to make all prior writes in the os buffer durable.
@@ -493,7 +583,13 @@ where
 
         Ok(())
     }
+}
 
+impl<K, V> Snapshot for KVLog<K, V>
+where
+    K: Clone + bincode::Encode,
+    V: Clone + bincode::Encode,
+{
     /// On snapshot:
     /// The goal is to make the snapshotting process concurrency safe and crash safe.
     /// Hold all locks, pause the world when snapshotting excepting allowing read from mem -- this will slow the latency but guarantee the consistency of snapshot.
@@ -510,6 +606,11 @@ where
     async fn on_snapshot(&self) -> Result<bool, KVLogError> {
         // write_lock_log prevents other threads from writing to the log file
         let mut write_lock_log = self.log.write().await;
+
+        // force to flush all prior writes in the os buffer to the old wal
+        // in case there are unflushed writes in the os buffer, they will be lost on crashing or power loss.
+        write_lock_log.sync_all().await?;
+
         // write_lock_log_path prevents other threads from writing or reading the log file path
         let mut write_lock_log_path = self.log_path.write().await;
 
@@ -579,18 +680,6 @@ where
         write_lock_tmp_manifest.write_all(&manifest_bytes).await?;
         write_lock_tmp_manifest.sync_all().await?;
 
-        // rename manifest.tmp to manifest
-        rename(temp_manifest_path, manifest_path).await?;
-        let parent_dir =
-            Path::new(manifest_path)
-                .parent()
-                .ok_or(KVLogError::InvalidFilePathFormat {
-                    msg: "can not find parent dir of manifest".to_string(),
-                })?;
-        // for dir fsync, put read-only access
-        let dir = OpenOptions::new().read(true).open(parent_dir).await?;
-        dir.sync_all().await?;
-
         // updating all in-mem handles
 
         // update the snapshot file path var to point to the new snapshot file path
@@ -620,11 +709,31 @@ where
         // update the log file path var to point to the new log file path
         *write_lock_log_path = new_log_file_path;
 
+        // renaming manifest file is the check commit point, so we need to
+        // it happens after in-mem handle switch
+        // If crash before manifest rename, the manifest is still old
+        // If crash after manifest rename, you’re already writing to the new WAL
+        // If manifest rename fails, you’ve already switched WAL and updated snapshot_path in memory
+
+        // rename manifest.tmp to manifest
+        rename(temp_manifest_path, manifest_path).await?;
+        let parent_dir =
+            Path::new(manifest_path)
+                .parent()
+                .ok_or(KVLogError::InvalidFilePathFormat {
+                    msg: "can not find parent dir of manifest".to_string(),
+                })?;
+        // for dir fsync, put read-only access
+        let dir = OpenOptions::new().read(true).open(parent_dir).await?;
+        dir.sync_all().await?;
+
+        // reset wal size to 0
+        self.current_wal_size.store(0, Ordering::Relaxed);
+
         Ok(true)
     }
 }
 
-// please include the following:
 // - brief description of implementation decisions, including:
 //   - what is persisted (files, directories) and any significant tradeoffs
 //   - choices about contention and access control (e.g. Mutexes, Marker files, etc.)
@@ -634,7 +743,8 @@ where
 // - extra bonus: thoughts on the interface (e.g. trait_variant, non-mut get and delete, return value on set, etc.)
 #[cfg(test)]
 mod tests {
-    use crate::{utils::crc32, KVLog, KVStore};
+    use crate::kvlog::KVLog;
+    use crate::{KVStore, utils::crc32};
     use std::collections::HashSet;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -662,9 +772,11 @@ mod tests {
     }
 
     async fn setup(path: &str) -> KVLog<String, String> {
-        KVLog::<String, String>::load(path)
+        let (log, _) = KVLog::<String, String>::load(path)
             .await
-            .expect("load failed")
+            .expect("load failed");
+
+        log
     }
 
     async fn read_wal_entries(log: &KVLog<String, String>) -> Vec<super::WALEntry<String, String>> {
@@ -989,7 +1101,6 @@ mod tests {
         assert_eq!(delete_count, deletes);
     }
 
-    // TODO:
     // production ready:
     // - Crash safety
     //       - Handle partial/torn WAL entries without panic - return error and let the caller decide what to do. Done
@@ -1016,22 +1127,6 @@ mod tests {
     //       - Explicit guarantees (durability, consistency, concurrency).
     //       - Known limitations (e.g., single‑process only).
     //   - Resource management
-    //       - WAL compaction / snapshotting to cap log growth.
-    //       - Backpressure or size limits to avoid disk exhaustion.
-
-    // set a config value for the threshold of each wal log file -- log file size
-    // logic to determine if the log file should be splited by size
-
-    // on snapshot:
-    // hold write lock on current wal log file so that no write nor read allowed on log, hold read lock on mem so only more read allowed from mem
-    // take snapshot on mem, write&fsync to snapshot.log file
-    // create a marker/manifest file to indicate the snapshot file name
-    // create a new wal log file with new name and repoint the current file var to this new file
-    // release read lock
-
-    // on restart:
-    // no write or read allowed until load() returns
-    // load the marker file first and see which wal the snapshot covers,
-    // load snapshot file into mem
-    // then load the latest wal log file
+    //       - WAL compaction / snapshotting to cap log growth. Done
+    //       - Backpressure or size limits to avoid disk exhaustion. Done
 }

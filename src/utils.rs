@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 use tokio::sync::RwLock;
@@ -41,8 +42,8 @@ pub(crate) fn parse_prefix_bytes(d: &[u8]) -> Result<u32, KVLogError> {
     Ok(u32::from_le_bytes([d[0], d[1], d[2], d[3]]))
 }
 
-pub(crate) fn is_wal_log_full(current_size: usize) -> bool {
-    if current_size > WAL_FILE_MAX_SIZE {
+pub(crate) fn is_wal_log_full(currant_size: &AtomicUsize) -> bool {
+    if currant_size.load(Ordering::Acquire) > WAL_FILE_MAX_SIZE {
         return true;
     }
     false

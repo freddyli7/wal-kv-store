@@ -6,11 +6,12 @@
 
 mod error;
 mod kvlog;
+mod kvlog_handler;
 mod lock;
 mod manifest;
 mod traits;
 mod utils;
 
 pub use error::KVLogError;
-pub use kvlog::KVLog;
+pub use kvlog_handler::KVLogHandler;
 pub use traits::KVStore;
